@@ -200,6 +200,10 @@ python3 scripts/gmail_literature_trigger.py --test-mode --batch-size 10
 - **队列管理**：状态持久化存储于 `outputs/accumulator_state.json`；
 - **批次触发**：第 1~9 篇静默排队，第 10 篇入队瞬间自动唤醒 ARTA 综述引擎，输出对应批次的交付物至 `outputs/gmail_simulation/batch_N/`。
 
+> **工程化实现**：本节设计已由 `scripts/gmail_cnki_bridge.py` 落地为三个子命令
+> （`push` 只推知网任务单到 Gmail / `ingest` 经 nature-downloader 下载知网 PDF 回传 Gmail / `watch` IMAP 接收并批次触发综述），
+> 含离线 `--selftest` 与 14 项单测。实操步骤见 [docs/gmail-cnki-bridge-guide.md](gmail-cnki-bridge-guide.md)。
+
 ---
 
 ## 八、 知网 (CNKI) 真实文献检索与 PDF 本地下载全解析（插件调用原理与实操路径）
