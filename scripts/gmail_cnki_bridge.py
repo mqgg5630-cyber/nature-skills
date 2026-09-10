@@ -5,6 +5,7 @@ Gmail ↔ CNKI Literature Bridge (Nature-Skills Edition)
 把「只推知网文献到 Gmail → 下载知网 PDF 回传 Gmail → 攒够阈值自动生成综述」
 的完整闭环封装为一个脚本，四个子命令：
 
+  doctor     环境体检（Python / Gmail 凭据 / Node 22+ / nature-downloader / 可选依赖）
   selftest   离线全链路仿真（无需网络、无需凭据）：
              任务单邮件构建 → 知网过滤 → PDF 附件回环 → 批次阈值触发综述
   push       发送「仅知网」文献任务单邮件到 Gmail（SMTP）
@@ -694,9 +695,85 @@ def cmd_watch(args: argparse.Namespace, cfg: GmailConfig) -> None:
         run_once()
 
 
+
+def cmd_doctor(args: argparse.Namespace, cfg: GmailConfig) -> None:
+    """环境体检：本地真正跑起来之前，先确认依赖 / 凭据 / 下载器是否就绪。"""
+    import shutil
+
+    ok_all = True
+
+    def line(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal ok_all
+        ok_all = ok_all and ok
+        print(f"  {'✅' if ok else '❌'} {name}" + (f" — {detail}" if detail else ""))
+
+    def warn(name: str, detail: str = "") -> None:
+        print(f"  ⚠️  {name}" + (f" — {detail}" if detail else ""))
+
+    print("=" * 72)
+    print("🩺 [doctor] Gmail ↔ CNKI 桥环境体检")
+    print("=" * 72)
+
+    line("Python 版本 ≥ 3.9", sys.version_info >= (3, 9), sys.version.split()[0])
+
+    # Gmail 凭据
+    line("GMAIL_EMAIL 已配置", bool(cfg.email), cfg.email or "未设置（push/ingest/watch 需要）")
+    pw = cfg.app_password.replace(" ", "")
+    line("GMAIL_APP_PASSWORD 已配置", bool(pw), f"{len(pw)} 位" if pw else "未设置")
+    if pw and len(pw) != 16:
+        warn("应用专用密码长度不是 16 位", "请确认用的是 Google 应用专用密码，而不是登录密码")
+
+    # Node + nature-downloader
+    node_path = shutil.which(getattr(args, "node", "node") or "node")
+    line("node 可执行", bool(node_path), node_path or "未找到（真实知网下载需要 Node 22+）")
+    if node_path:
+        try:
+            ver = subprocess.run([node_path, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+            major = int(ver.lstrip("v").split(".")[0])
+            line("Node 主版本 ≥ 22", major >= 22, ver)
+        except Exception as exc:  # pragma: no cover
+            warn("无法读取 node 版本", str(exc))
+
+    skill_dir = Path(args.skill_dir) if getattr(args, "skill_dir", None) else default_skill_dir()
+    script = skill_dir / "scripts" / "batch_download.mjs"
+    line("nature-downloader 入口存在", script.exists(), str(script))
+
+    # 可选依赖
+    try:
+        import fitz  # noqa: F401
+        line("PyMuPDF (fitz) 可用", True, "PDF 页数/文本抽取增强可用")
+    except Exception:
+        warn("PyMuPDF (fitz) 未安装", "非必需；装了可提升 PDF 解析（pip install pymupdf）")
+
+    # 网络连通（不需要凭据）
+    if getattr(args, "check_network", False):
+        import socket
+        for host, port, label in ((SMTP_HOST, SMTP_PORT, "SMTP"), (IMAP_HOST, IMAP_PORT, "IMAP")):
+            try:
+                with socket.create_connection((host, port), timeout=8):
+                    line(f"{label} 可连通 {host}:{port}", True)
+            except Exception as exc:
+                line(f"{label} 可连通 {host}:{port}", False, str(exc))
+
+    print("=" * 72)
+    if ok_all:
+        print("✅ DOCTOR PASS — 关键项就绪，可以执行 push / ingest / watch")
+    else:
+        print("❌ DOCTOR 有未通过项，请按上面 ❌ 提示补齐后再跑真实流程")
+    print("=" * 72)
+    if not ok_all:
+        sys.exit(1)
+
+
 def cmd_selftest(args: argparse.Namespace) -> None:
     """离线全链路仿真：不触网、不需要凭据。"""
+    import shutil
+
     out = Path(args.out)
+    # 每次自检都从干净目录开始：否则上一轮遗留的 index.json / accumulator_state.json
+    # 会让本轮条目全部命中 SHA-256 去重，导致「入库」步骤误报失败。
+    if out.exists() and not getattr(args, "keep_output", False):
+        shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True, exist_ok=True)
     topic = "食源性鲜味肽高通量筛选与呈味机制解析"
     cfg = GmailConfig(email="selftest@example.org", app_password="")
@@ -795,6 +872,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Gmail ↔ CNKI 文献桥（Nature-Skills）")
     parser.add_argument("--selftest", action="store_true", help="离线全链路仿真（默认）")
     parser.add_argument("--out", type=str, default="outputs/gmail_bridge_selftest", help="selftest 输出目录")
+    parser.add_argument("--keep-output", action="store_true",
+                        help="selftest 保留上一轮产物（默认先清空，避免去重状态导致误报失败）")
     parser.add_argument("--email", type=str, default=None, help="Gmail 账号（或 env GMAIL_EMAIL）")
     parser.add_argument("--app-password", dest="app_password", type=str, default=None,
                         help="Gmail 应用专用密码（或 env GMAIL_APP_PASSWORD）")
@@ -827,6 +906,11 @@ def main() -> None:
     p_watch.add_argument("--interval", type=int, default=300, help="轮询间隔秒")
     p_watch.add_argument("--mark-seen", action="store_true", help="处理完标记 Gmail 已读")
 
+    p_doctor = sub.add_parser("doctor", help="环境体检（Python/凭据/Node/下载器/可选依赖）")
+    p_doctor.add_argument("--node", type=str, default="node")
+    p_doctor.add_argument("--skill-dir", type=str, default=None)
+    p_doctor.add_argument("--check-network", action="store_true", help="额外测试 Gmail SMTP/IMAP 端口连通性")
+
     args = parser.parse_args()
     cfg = GmailConfig.from_args(args)
 
@@ -838,6 +922,8 @@ def main() -> None:
         cmd_ingest(args, cfg)
     elif args.mode == "watch":
         cmd_watch(args, cfg)
+    elif args.mode == "doctor":
+        cmd_doctor(args, cfg)
     else:
         parser.print_help()
 

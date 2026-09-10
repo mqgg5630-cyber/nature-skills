@@ -24,6 +24,7 @@ import argparse
 import dataclasses
 import email
 import imaplib
+import subprocess
 import json
 import os
 import sys
@@ -214,7 +215,35 @@ def main():
     parser.add_argument("--email", type=str, default=None, help="Gmail account (for live mode)")
     parser.add_argument("--app-password", type=str, default=None, help="Gmail App Password (for live mode)")
 
+    parser.add_argument("--live", action="store_true",
+                        help="实时模式：委托 gmail_cnki_bridge.py watch 监听 Gmail 收件箱")
+    parser.add_argument("--folder", type=str, default="INBOX", help="IMAP 文件夹（live 模式）")
+    parser.add_argument("--library", type=str, default="outputs/gmail_library", help="本地文献库目录（live 模式）")
+    parser.add_argument("--daemon", action="store_true", help="live 模式持续轮询")
+    parser.add_argument("--interval", type=int, default=300, help="live 模式轮询间隔秒")
+
     args = parser.parse_args()
+
+    if args.live:
+        # 实时 IMAP 监听已在 gmail_cnki_bridge.py 中实现，这里直接委托，避免两份重复实现。
+        cmd = [
+            sys.executable, str(Path(__file__).parent / "gmail_cnki_bridge.py"),
+            "watch",
+            "--folder", args.folder,
+            "--batch-size", str(args.batch_size),
+            "--topic", args.topic,
+            "--library", args.library,
+            "--interval", str(args.interval),
+        ]
+        if args.daemon:
+            cmd.append("--daemon")
+        if args.email:
+            cmd += ["--email", args.email]
+        if args.app_password:
+            cmd += ["--app-password", args.app_password]
+        print("📡 [live] 委托 gmail_cnki_bridge.py watch 执行实时 Gmail 监听 …")
+        raise SystemExit(subprocess.call(cmd))
+
     simulate_gmail_stream(batch_size=args.batch_size, topic=args.topic)
 
 

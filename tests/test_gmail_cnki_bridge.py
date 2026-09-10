@@ -195,3 +195,49 @@ class TestLocalPdfMatching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDoctorAndSimulationFlags(unittest.TestCase):
+    """doctor 子命令与仿真数据标记的回归测试。"""
+
+    def test_doctor_reports_missing_credentials(self):
+        import argparse as _argparse
+        import io
+        import contextlib
+        import gmail_cnki_bridge as bridge
+
+        args = _argparse.Namespace(node="node", skill_dir=None, check_network=False)
+        cfg = bridge.GmailConfig(email="", app_password="")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                bridge.cmd_doctor(args, cfg)
+        self.assertEqual(ctx.exception.code, 1)
+        out = buf.getvalue()
+        self.assertIn("GMAIL_EMAIL", out)
+        self.assertIn("DOCTOR", out)
+
+    def test_doctor_passes_with_credentials(self):
+        import argparse as _argparse
+        import io
+        import contextlib
+        import gmail_cnki_bridge as bridge
+
+        args = _argparse.Namespace(node="node", skill_dir=None, check_network=False)
+        cfg = bridge.GmailConfig(email="user@example.com", app_password="a" * 16)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bridge.cmd_doctor(args, cfg)
+        self.assertIn("DOCTOR PASS", buf.getvalue())
+
+    def test_cnki_downloader_marks_records_as_simulated(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from cnki_pdf_downloader import CNKIPDFDownloader
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = CNKIPDFDownloader(output_dir=tmpdir).search_and_download(topic="鲜味肽", count=1)
+            self.assertTrue(records[0].simulated)
+            self.assertEqual(records[0].provenance, "simulated-catalog")
+            manifest = _json.loads((Path(tmpdir) / "cnki_download_manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["simulated"])

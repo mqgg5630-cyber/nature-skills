@@ -39,7 +39,17 @@ Gmail 在这里是**文献总线**：任务单（元数据）和 PDF（全文）
 | nature-downloader 配置 | `python3 skills/nature-downloader/scripts/configure_school.py url "<你平时进馆的链接>"`（见该 skill 文档） |
 | PyMuPDF（可选） | `pip install pymupdf`：CAJ 转 PDF、仿真 PDF 排版需要 |
 
-**任意环境先跑自检**（不触网、不要凭据，验证过滤/邮件回环/入库/批次触发/去重）：
+**先做环境体检**（检查 Python / Gmail 凭据 / Node 22+ / nature-downloader / 可选依赖）：
+
+```bash
+python3 scripts/gmail_cnki_bridge.py doctor
+# 顺带测一下 Gmail 端口连通性（不需要凭据也能测）
+python3 scripts/gmail_cnki_bridge.py doctor --check-network
+```
+
+体检全绿才建议跑真实 `push / ingest / watch`；有 ❌ 时脚本以退出码 1 结束，方便脚本化编排。
+
+**再跑离线自检**（不触网、不要凭据，验证过滤/邮件回环/入库/批次触发/去重）：
 
 ```bash
 python3 scripts/gmail_cnki_bridge.py --selftest
@@ -181,6 +191,34 @@ outputs/
 ## 九、测试
 
 ```bash
-python3 -m unittest tests.test_gmail_cnki_bridge -v   # 14 项离线单测
-python3 scripts/gmail_cnki_bridge.py --selftest        # 端到端仿真
+python3 -m unittest tests.test_gmail_cnki_bridge -v   # 17 项离线单测
+python3 scripts/gmail_cnki_bridge.py --selftest        # 端到端仿真（可重复执行，默认自动清空上轮产物）
+python3 scripts/gmail_cnki_bridge.py --selftest --keep-output  # 需要保留上轮产物时
+python3 scripts/gmail_cnki_bridge.py doctor            # 环境体检
+```
+
+## 十、关于仿真数据的说明（重要）
+
+`scripts/cnki_pdf_downloader.py` 内置的 4 条文献目录是**仿真样例数据**，产出的 PDF 是占位文档，
+不是知网原文；其 manifest 与记录都带 `"simulated": true / "provenance": "simulated-catalog"` 标记，
+便于下游区分。它的用途只有一个：在没有机构登录态的机器上打通全链路。
+
+**真实知网原文**请走：
+
+```bash
+python3 scripts/gmail_cnki_bridge.py ingest --entries <你的条目JSON>
+```
+
+底层调用 `skills/nature-downloader`（CNKI 路由），需机构授权 + 已登录 Chrome + Node 22+。
+若 `ingest_report.json` 中出现 `carsi_waiting_user`、`publisher_verification_waiting_user`
+等状态，说明需要你在浏览器里手动完成一次登录/验证，然后重跑该条目。
+
+## 十一、旧脚本的实时模式
+
+`scripts/gmail_literature_trigger.py` 原本只有仿真模式，现已补上 `--live`：
+它会委托本桥的 `watch` 执行真实 IMAP 监听（避免两份重复实现）。
+
+```bash
+python3 scripts/gmail_literature_trigger.py --live --batch-size 10 --daemon \
+    --topic "食源性鲜味肽机器学习筛选与受体机制"
 ```

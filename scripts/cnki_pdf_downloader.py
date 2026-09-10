@@ -3,7 +3,13 @@
 CNKI Literature & PDF Local Downloader (Zotero & ARTA Edition)
 ==============================================================
 A specialized module to:
-1. Search and resolve Chinese literature metadata from CNKI / Academic APIs.
+⚠️ 重要说明（simulation notice）
+本模块内置的文献目录是**仿真样例数据**，用于离线打通 “元数据 → PDF 落盘 → Zotero 同步 → 综述”
+全链路，产出的 PDF 不是知网原文。真实知网下载请走：
+    python3 scripts/gmail_cnki_bridge.py ingest --entries <条目JSON>
+（底层 skills/nature-downloader 的 CNKI 路由，需机构授权 + 已登录 Chrome + Node 22+）
+
+1. Search and resolve Chinese literature metadata from CNKI / Academic APIs (simulated catalog).
 2. Download and save authentic PDF documents to local storage.
 3. Inspect and verify local PDF paths, file sizes, and page counts.
 4. Export a manifest and sync directly with Zotero local storage directory.
@@ -55,6 +61,8 @@ class CNKIPaperRecord:
     file_size_bytes: int = 0
     page_count: int = 0
     status: str = "pending"
+    simulated: bool = True
+    provenance: str = "simulated-catalog"
 
 
 class CNKIPDFDownloader:
@@ -72,8 +80,12 @@ class CNKIPDFDownloader:
         Searches literature from CNKI database and downloads PDFs to local disk.
         """
         print("=" * 75)
-        print("🇨🇳 [CNKI Downloader] 启动中国知网文献检索与 PDF 本地下载引擎")
+        print("🇨🇳 [CNKI Downloader] 知网文献元数据 / PDF 本地落盘（仿真目录模式）")
         print("=" * 75)
+        print("⚠️  注意：本脚本内置的 4 条文献目录为【仿真样例数据】，用于打通流程，")
+        print("   不是真实检索结果。要下载真实知网 PDF，请使用：")
+        print("   python3 scripts/gmail_cnki_bridge.py ingest --entries <条目JSON>")
+        print("   （底层调用 skills/nature-downloader，需机构授权 + 已登录 Chrome + Node 22+）")
         print(f"🔍 检索主题词: 《{topic}》 | 目标下载篇数: {count} 篇")
         print(f"📂 本地保存目录: {self.output_dir.resolve()}\n")
 
@@ -108,12 +120,15 @@ class CNKIPDFDownloader:
             "total_downloaded": len(downloaded_records),
             "download_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "local_storage_dir": str(self.output_dir.resolve()),
+            "simulated": True,
+            "provenance": "simulated-catalog",
+            "real_download_hint": "python3 scripts/gmail_cnki_bridge.py ingest --entries <entries.json>",
             "papers": [dataclasses.asdict(r) for r in downloaded_records]
         }
         manifest_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
         print("=" * 75)
-        print("🎉 [知网文献第一步完成] 全部真实 PDF 已成功下载到本地！")
+        print("🎉 [仿真流程完成] 全部占位 PDF 已生成到本地（非真实知网原文）！")
         print("=" * 75)
         print(f"📋 清单索引文件: {manifest_path.resolve()}\n")
         print("📄 本地有效 PDF 文件绝对路径列表：")
@@ -263,7 +278,9 @@ class CNKIPDFDownloader:
             local_pdf_path=str(target_path.resolve()),
             file_size_bytes=file_size,
             page_count=page_count,
-            status="Downloaded_Local_OK"
+            status="Downloaded_Local_OK",
+            simulated=True,
+            provenance="simulated-catalog",
         )
 
     def _sync_to_zotero_storage(self, record: CNKIPaperRecord) -> None:
