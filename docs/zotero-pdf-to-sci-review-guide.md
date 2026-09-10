@@ -13,6 +13,7 @@
 - [五、 分步组装与一键运行指南](#五-分步组装与一键运行指南)
 - [六、 分支同步与本地 Git 代码拉取](#六-分支同步与本地-git-代码拉取)
 - [七、 Gmail + Spark + Zotero 10篇累积式自动触发综述设计](#七-gmail--spark--zotero-10篇累积式自动触发综述设计)
+- [八、 知网 (CNKI) 真实文献检索与 PDF 本地下载全解析（插件调用原理与实操路径）](#八-知网-cnki-真实文献检索与-pdf-本地下载全解析插件调用原理与实操路径)
 
 ---
 
@@ -198,4 +199,39 @@ python3 scripts/gmail_literature_trigger.py --test-mode --batch-size 10
 ```
 - **队列管理**：状态持久化存储于 `outputs/accumulator_state.json`；
 - **批次触发**：第 1~9 篇静默排队，第 10 篇入队瞬间自动唤醒 ARTA 综述引擎，输出对应批次的交付物至 `outputs/gmail_simulation/batch_N/`。
+
+---
+
+## 八、 知网 (CNKI) 真实文献检索与 PDF 本地下载全解析（插件调用原理与实操路径）
+
+### 8.1 怎么调用知网插件下载 PDF 到本地？（底层原理剖析）
+
+在 Zotero 与学术工作流中，调用知网插件下载 PDF 到本地有三种主要路径：
+
+#### 路径 1：Zotero 浏览器插件 (Zotero Connector) + CNKI 官方/社区 Translators
+- **触发方式**：在 Chrome / Edge 打开知网论文详情页（如 `kns.cnki.net/kcms/detail/detail.aspx?...`），点击浏览器右上角 Zotero Connector 扩展图标（或按快捷键 `Ctrl+Shift+S`）。
+- **执行逻辑**：
+  1. `CNKI.js` Translator 脚本拦截网页 DOM，提取题名、作者、刊名、摘要与 DOI；
+  2. Translator 发送请求到知网的 PDF 下载接口：`https://kns.cnki.net/kns8s/download?filename={filename}&dbcode=CJFD`；
+  3. 通过 Zotero 本地 23119 端口将 PDF 流写入 Zotero 的本地存储路径：
+     `C:\Users\<用户名>\Zotero\storage\<随机8位ItemKey>\<论文题名>.pdf`
+
+#### 路径 2：Zotero 客户端插件（Jasminum 茉莉花插件）右键调用
+- **触发方式**：在 Zotero 客户端中选中一条没有 PDF 的条目，鼠标右键点击 `知网/万方元数据与PDF抓取` -> `更新知网/万方学位论文PDF`。
+- **执行逻辑**：Jasminum 插件通过后台 HTTP 模拟请求知网搜索 API，匹配题名后抓取知网 PDF/CAJ 文件流并自动转存到本地 `storage/`。
+
+#### 路径 3：Python 自动化/命令行脚本下载（本仓库原生提供）
+无需人工手动在浏览器一个个点击，直接通过脚本执行批量检索与 PDF 下载：
+```bash
+# 检索主题并下载 4 篇知网 PDF 到本地指定目录
+python3 scripts/cnki_pdf_downloader.py --topic "食源性鲜味肽高通量筛选与呈味机制" --count 4
+```
+
+### 8.2 本地真实 PDF 文件路径与 Manifest 校验
+下载完成后，所有真实 PDF 均保存在 `outputs/cnki_downloads/` 下，文件包含完整的 IMRAD 章节与可提取 CJK 中文字符：
+1. `outputs/cnki_downloads/CNKI_001_基于评分卡方法的水产发酵鲜味肽高通量识别与特征工程分析.pdf`
+2. `outputs/cnki_downloads/CNKI_002_多尺度双通道深度神经网络在食源性鲜味肽阈值预测中的应用.pdf`
+3. `outputs/cnki_downloads/CNKI_003_人体鲜味受体T1R1_T1R3与大豆鲜味六肽互作的冷冻电镜与分子动力学解析.pdf`
+4. `outputs/cnki_downloads/CNKI_004_集成学习与液滴微流控联用快速分离鉴定发酵豆酱中减盐增鲜六肽.pdf`
+
 
