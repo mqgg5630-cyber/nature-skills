@@ -241,3 +241,54 @@ class TestDoctorAndSimulationFlags(unittest.TestCase):
             self.assertEqual(records[0].provenance, "simulated-catalog")
             manifest = _json.loads((Path(tmpdir) / "cnki_download_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["simulated"])
+
+
+class TestEventHooks(unittest.TestCase):
+    """事件钩子（--on-event / --webhook）的离线测试。"""
+
+    def test_on_event_command_receives_json(self):
+        import gmail_cnki_bridge as bridge
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sink = Path(tmpdir) / "event.json"
+            event = {"event": "paper_ingested", "item_key": "CNKI_001", "title": "鲜味肽"}
+            # 子进程把 stdin 原样落盘，验证事件 JSON 完整传递
+            bridge.fire_hook(f'{sys.executable} -c "import sys,pathlib;'
+                             f'pathlib.Path(sys.argv[1]).write_text(sys.stdin.read(),encoding=\'utf-8\')" '
+                             f'"{sink}"', None, event)
+            self.assertTrue(sink.exists())
+            self.assertEqual(json.loads(sink.read_text(encoding="utf-8"))["item_key"], "CNKI_001")
+
+    def test_on_event_sets_env_vars(self):
+        import gmail_cnki_bridge as bridge
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sink = Path(tmpdir) / "env.txt"
+            event = {"event": "review_ready", "item_key": "CNKI_777", "pdf_path": "/tmp/a.pdf"}
+            bridge.fire_hook(f'{sys.executable} -c "import os,sys,pathlib;'
+                             f'pathlib.Path(sys.argv[1]).write_text('
+                             f'os.environ[\'CNKI_EVENT_TYPE\']+\'|\'+os.environ[\'CNKI_ITEM_KEY\'],encoding=\'utf-8\')" '
+                             f'"{sink}"', None, event)
+            self.assertEqual(sink.read_text(encoding="utf-8"), "review_ready|CNKI_777")
+
+    def test_hook_failure_is_swallowed(self):
+        """钩子失败绝不能中断监听循环。"""
+        import gmail_cnki_bridge as bridge
+
+        bridge.fire_hook("this-command-definitely-does-not-exist-xyz", None, {"event": "x"})
+        bridge.fire_hook(None, "http://127.0.0.1:1/nope", {"event": "x"})
+
+    def test_watch_parser_accepts_push_mode(self):
+        import gmail_cnki_bridge as bridge
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit):
+                sys.argv = ["gmail_cnki_bridge.py", "watch", "--help"]
+                bridge.main()
+        out = buf.getvalue()
+        self.assertIn("--push-mode", out)
+        self.assertIn("--on-event", out)
+        self.assertIn("--webhook", out)

@@ -222,3 +222,78 @@ python3 scripts/gmail_cnki_bridge.py ingest --entries <你的条目JSON>
 python3 scripts/gmail_literature_trigger.py --live --batch-size 10 --daemon \
     --topic "食源性鲜味肽机器学习筛选与受体机制"
 ```
+
+## 十二、让 Spark「一有邮件就触发」（实时推送）
+
+默认 `watch --daemon` 是**定时轮询**（`--interval` 秒）。要做到邮件一到就干活，用 IMAP IDLE：
+
+```powershell
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
+    --batch-size 10 --topic "食源性鲜味肽" `
+    --on-event "python scripts/spark_event_hook.py"
+```
+
+- `--push-mode idle`：脚本阻塞在 IMAP IDLE 上，Gmail 一有新邮件立刻返回并处理（秒级），
+  不再空转轮询；`--idle-timeout` 默认 600s 做保活重连（Gmail 要求 <29 分钟）。
+  IDLE 不可用时会自动打印告警并退回轮询，不会卡死。
+- 启动时会**先收一轮存量邮件**，避免开机前积压的邮件被漏掉。
+
+### 两种把事件交给 Spark 的方式
+
+| 方式 | 参数 | 适用 |
+|---|---|---|
+| 本地命令 | `--on-event "<命令>"` | Spark 在同一台机器上，直接拉起脚本/CLI |
+| HTTP 回调 | `--webhook "http://127.0.0.1:8848/cnki"` | Spark 是常驻服务，走 HTTP POST |
+
+两者可同时使用，都是 best-effort：钩子失败只告警，**绝不中断监听循环**。
+
+### 事件格式
+
+`paper_ingested`（单篇 PDF 入库时触发）：
+
+```json
+{"event":"paper_ingested","topic":"食源性鲜味肽","item_key":"CNKI_001",
+ "title":"…","pdf_path":"outputs/gmail_library/CNKI_001/CNKI_001.pdf",
+ "queue_count":3,"batch_size":10,"library_dir":"…","timestamp":"2026-09-10 13:20:00"}
+```
+
+`review_ready`（攒够阈值、综述编译完成时触发）：
+
+```json
+{"event":"review_ready","topic":"食源性鲜味肽","batch_id":1,"paper_count":10,
+ "chapter1_path":"…/thesis_chapter1_review.md","payload_path":"…/arta_synthesis_payload.json",
+ "ppt_path":"…/arta_ppt_payload.json","library_dir":"…","timestamp":"…"}
+```
+
+命令模式下事件同时通过 **stdin** 和环境变量 `CNKI_EVENT` / `CNKI_EVENT_TYPE` /
+`CNKI_ITEM_KEY` / `CNKI_PDF_PATH` 传入，shell 和脚本都好接。
+
+### 现成的 Spark 钩子：`scripts/spark_event_hook.py`
+
+不用自己写胶水，直接挂上即可。它会：
+1. 把事件追加进 `outputs/spark_events/events.jsonl`（Spark 可以 tail 这个文件）；
+2. 为每个事件写一份 `outputs/spark_events/tasks/<时间戳>_<类型>_<key>.json` 任务单
+   （Spark 扫目录取任务，带 `status: pending` 和 `suggested_action`）；
+3. 可选直接拉起 Spark 命令，支持占位符 `{item_key} {pdf_path} {payload_path}
+   {chapter1_path} {ppt_path} {topic} {task_path}`：
+
+```powershell
+--on-event "python scripts/spark_event_hook.py --spark-cmd 'spark run review --payload {payload_path}' --only review_ready"
+```
+
+`--only review_ready` 表示只在综述就绪时才叫 Spark，单篇入库只记账不打扰。
+
+### 完整的一条龙命令（推荐）
+
+```powershell
+$env:GMAIL_EMAIL="your_account@gmail.com"
+$env:GMAIL_APP_PASSWORD="xxxxxxxxxxxxxxxx"
+
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
+    --batch-size 10 --topic "食源性鲜味肽高通量筛选与呈味机制解析" `
+    --library outputs/gmail_library --mark-seen `
+    --on-event "python scripts/spark_event_hook.py --spark-cmd 'spark run review --payload {payload_path}' --only review_ready"
+```
+
+> 说明：Gmail 没有真正的「服务端 push 到本机」能力（除非上 Google Cloud Pub/Sub + 公网回调），
+> IMAP IDLE 是免公网、免额外服务的最实时方案，延迟通常在数秒内。

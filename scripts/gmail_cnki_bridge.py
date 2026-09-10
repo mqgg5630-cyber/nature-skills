@@ -13,7 +13,8 @@ Gmail ↔ CNKI Literature Bridge (Nature-Skills Edition)
                 a) 调 nature-downloader（batch_download.mjs，CNKI 路由）下载真实 PDF；或
                 b) 直接打包本地目录里已有的 PDF（--local-pdf-dir，跳过下载器）
              然后作为 [CNKI-INGEST] PDF 附件邮件回传 Gmail
-  watch      IMAP 轮询 Gmail，接收 [CNKI-INGEST] 邮件 →
+  watch      监听 Gmail（--push-mode idle 为 IMAP IDLE 实时推送，邮件一到即触发；
+             可用 --on-event / --webhook 把事件交给 Spark），接收 [CNKI-INGEST] 邮件 →
              PDF 归档到本地文献库 → LiteratureAccumulator 累积 →
              达到批次阈值自动触发 ARTA 综述编译
 
@@ -54,6 +55,7 @@ import json
 import os
 import re
 import smtplib
+import socket
 import subprocess
 import sys
 import time
@@ -559,6 +561,82 @@ def watch_once(
     return reports
 
 
+
+# ---------------------------------------------------------------------------
+# 事件钩子：邮件一到就通知 Spark
+# ---------------------------------------------------------------------------
+
+def fire_hook(hook_cmd: Optional[str], hook_url: Optional[str], event: Dict[str, Any]) -> None:
+    """把事件同时投递给：本地命令（--on-event）与 HTTP 回调（--webhook）。
+
+    - 命令模式：事件 JSON 通过环境变量 CNKI_EVENT 传入，并作为 stdin 写给子进程，
+      这样 Spark 侧无论用 shell 还是脚本都能拿到完整上下文。
+    - Webhook 模式：POST application/json。
+    两者都是 best-effort，失败只告警，绝不影响主监听循环。
+    """
+    payload = json.dumps(event, ensure_ascii=False)
+    if hook_cmd:
+        try:
+            env = dict(os.environ)
+            env["CNKI_EVENT"] = payload
+            env["CNKI_EVENT_TYPE"] = str(event.get("event", ""))
+            env["CNKI_ITEM_KEY"] = str(event.get("item_key", ""))
+            env["CNKI_PDF_PATH"] = str(event.get("pdf_path", "") or "")
+            subprocess.run(hook_cmd, shell=True, input=payload, text=True,
+                           encoding="utf-8", errors="replace", timeout=600, env=env)
+            print(f"   🔔 已触发本地钩子: {hook_cmd}")
+        except Exception as exc:
+            print(f"   ⚠️  本地钩子执行失败（不影响监听）: {exc}")
+    if hook_url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                hook_url, data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                print(f"   🔔 已推送 webhook: {hook_url} → HTTP {resp.status}")
+        except Exception as exc:
+            print(f"   ⚠️  webhook 推送失败（不影响监听）: {exc}")
+
+
+def imap_idle_wait(cfg: GmailConfig, folder: str = "INBOX", timeout: int = 600) -> bool:
+    """用 IMAP IDLE 阻塞等待新邮件推送，返回 True 表示「可能有新邮件，去收一轮」。
+
+    Gmail 支持 IDLE；官方要求 29 分钟内重连一次，所以 timeout 默认 600s（10 分钟）。
+    imaplib 没有封装 IDLE，这里直接走底层命令。任何异常都退化为 False，
+    上层会 fallback 到轮询，保证不会因为 IDLE 不可用而卡死。
+    """
+    try:
+        with imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port) as conn:
+            conn.login(cfg.email, cfg.app_password)
+            conn.select(folder, readonly=True)
+            tag = conn._new_tag()
+            conn.send(b"%s IDLE\r\n" % tag)
+            conn.readline()  # "+ idling"
+            conn.sock.settimeout(timeout)
+            try:
+                while True:
+                    line = conn.readline()
+                    if not line:
+                        return False
+                    upper = line.upper()
+                    # EXISTS = 新邮件到达；RECENT 同理
+                    if b"EXISTS" in upper or b"RECENT" in upper:
+                        return True
+            except socket.timeout:
+                return False
+            finally:
+                try:
+                    conn.send(b"DONE\r\n")
+                    conn.readline()
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"   ⚠️  IDLE 不可用，退回轮询: {exc}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
@@ -661,6 +739,13 @@ def cmd_watch(args: argparse.Namespace, cfg: GmailConfig) -> None:
     print(f"📡 [watch] 监听 Gmail（{cfg.email} / {args.folder}） | 主题: {args.topic}")
     print(f"   文献库: {library_dir.resolve()} | 批次阈值: {args.batch_size} 篇")
 
+    hook_cmd = getattr(args, "on_event", None)
+    hook_url = getattr(args, "webhook", None)
+    push_mode = getattr(args, "push_mode", "poll")
+    if hook_cmd or hook_url:
+        print(f"   事件钩子: cmd={hook_cmd or '-'} | webhook={hook_url or '-'}")
+    print(f"   触发方式: {'IMAP IDLE 实时推送' if push_mode == 'idle' else f'轮询（每 {args.interval}s）'}")
+
     def run_once() -> None:
         reports = watch_once(
             cfg, accumulator, library_dir, topic=args.topic,
@@ -672,23 +757,57 @@ def cmd_watch(args: argparse.Namespace, cfg: GmailConfig) -> None:
         for r in reports:
             if r["status"] == "ingested":
                 print(f"   📥 入库: {r['item_key']}（队列 {r['queue_count']}/{args.batch_size}）")
+                fire_hook(hook_cmd, hook_url, {
+                    "event": "paper_ingested",
+                    "topic": args.topic,
+                    "item_key": r.get("item_key"),
+                    "title": r.get("title"),
+                    "pdf_path": r.get("pdf_path"),
+                    "queue_count": r.get("queue_count"),
+                    "batch_size": args.batch_size,
+                    "library_dir": str(library_dir.resolve()),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
                 if r.get("review_triggered"):
                     res = r["review_result"]
                     print(f"   🎉 批次 #{res['batch_id']} 综述编译完成:")
                     print(f"      📄 {res['chapter1_path']}")
                     print(f"      📦 {res['payload_path']}")
                     print(f"      📊 {res['ppt_path']}")
+                    fire_hook(hook_cmd, hook_url, {
+                        "event": "review_ready",
+                        "topic": args.topic,
+                        "batch_id": res.get("batch_id"),
+                        "paper_count": res.get("paper_count"),
+                        "chapter1_path": res.get("chapter1_path"),
+                        "payload_path": res.get("payload_path"),
+                        "ppt_path": res.get("ppt_path"),
+                        "library_dir": str(library_dir.resolve()),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    })
             else:
                 print(f"   ⏭️  跳过: {r.get('item_key', '?')} ({r['status']})")
 
     if args.daemon:
         try:
+            # 先收一轮存量，再进入等待，避免启动前积压的邮件被漏掉
+            try:
+                run_once()
+            except Exception as exc:
+                print(f"   ⚠️  首轮收取异常: {exc}")
             while True:
+                if push_mode == "idle":
+                    # 阻塞在 IDLE 上，新邮件到达即刻返回；超时（保活）也回来收一轮兜底
+                    got = imap_idle_wait(cfg, folder=args.folder, timeout=args.idle_timeout)
+                    if got:
+                        print("   ⚡ IDLE 收到新邮件通知，立即处理 …")
+                else:
+                    time.sleep(args.interval)
                 try:
                     run_once()
                 except Exception as exc:  # 守护模式下网络抖动不应终止
-                    print(f"   ⚠️  轮询异常（{args.interval}s 后重试）: {exc}")
-                time.sleep(args.interval)
+                    print(f"   ⚠️  处理异常（稍后重试）: {exc}")
+                    time.sleep(min(args.interval, 60))
         except KeyboardInterrupt:
             print("\n👋 [watch] 已停止。")
     else:
@@ -905,6 +1024,14 @@ def main() -> None:
     p_watch.add_argument("--daemon", action="store_true", help="持续轮询（Ctrl+C 退出）")
     p_watch.add_argument("--interval", type=int, default=300, help="轮询间隔秒")
     p_watch.add_argument("--mark-seen", action="store_true", help="处理完标记 Gmail 已读")
+    p_watch.add_argument("--push-mode", choices=["poll", "idle"], default="poll",
+                         help="daemon 触发方式：poll=定时轮询；idle=IMAP IDLE 实时推送（邮件一到即触发）")
+    p_watch.add_argument("--idle-timeout", type=int, default=600,
+                         help="IDLE 保活重连秒数（Gmail 要求 <29 分钟，默认 600）")
+    p_watch.add_argument("--on-event", type=str, default=None,
+                         help="事件发生时执行的本地命令；事件 JSON 经 env CNKI_EVENT 和 stdin 传入（供 Spark 接管）")
+    p_watch.add_argument("--webhook", type=str, default=None,
+                         help="事件发生时 POST 的 HTTP 回调地址（JSON body）")
 
     p_doctor = sub.add_parser("doctor", help="环境体检（Python/凭据/Node/下载器/可选依赖）")
     p_doctor.add_argument("--node", type=str, default="node")
