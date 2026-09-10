@@ -27,7 +27,7 @@ class TestARTAZoteroReviewPipeline(unittest.TestCase):
         self.student = ThesisStudentInfo()
 
     def test_paper_items_structure(self):
-        self.assertEqual(len(self.mock_items), 4)
+        self.assertEqual(len(self.mock_items), 8)
         for item in self.mock_items:
             self.assertTrue(item.item_key)
             self.assertTrue(item.title)
@@ -39,7 +39,7 @@ class TestARTAZoteroReviewPipeline(unittest.TestCase):
         item = self.mock_items[0]
         card = PaperCardBuilder.build(item)
         self.assertEqual(card.item_key, item.item_key)
-        self.assertIn("可解释性", card.problem_statement)
+        self.assertIn("滇中黄牛", card.problem_statement)
         self.assertGreater(len(card.quantitative_findings), 0)
         self.assertTrue(card.proposed_mechanism)
         self.assertTrue(card.limitations_and_boundary)
@@ -56,18 +56,19 @@ class TestARTAZoteroReviewPipeline(unittest.TestCase):
         topic = "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
         chapter1_md = ARTAThesisSynthesizer.synthesize_thesis_chapter1(topic, self.student, cards)
         self.assertIn("# 第1章 绪论", chapter1_md)
-        self.assertIn("## 1.1 研究背景与重大科研意义", chapter1_md)
-        self.assertIn("## 1.2 食源性鲜味肽机器学习筛选模型研究进展", chapter1_md)
-        self.assertIn("## 1.3 人体鲜味受体 T1R1/T1R3 互作结构与分子呈味机制", chapter1_md)
-        self.assertIn("## 1.5 本文研究内容与章节架构", chapter1_md)
+        self.assertIn("## 1.1 研究背景与重大战略需求", chapter1_md)
+        self.assertIn("## 1.2 食源性基质多样性与酶解释放动力学", chapter1_md)
+        self.assertIn("## 1.3 鲜味肽机器学习筛选模型与算法演进", chapter1_md)
+        self.assertIn("## 1.4 人体鲜味受体 T1R1/T1R3 互作机制与分子构效解析", chapter1_md)
+        self.assertIn("## 1.5 研究空白、产业转化挑战与本文工作", chapter1_md)
 
     def test_arta_dual_track_payload(self):
         cards = [PaperCardBuilder.build(it) for it in self.mock_items]
         topic = "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
         payload = ARTAThesisSynthesizer.generate_arta_synthesis_payload(topic, self.student, self.mock_items, cards)
         self.assertEqual(payload["project_metadata"]["topic"], topic)
-        self.assertEqual(len(payload["csl_word_citations"]), 4)
-        self.assertEqual(len(payload["literature_inventory"]), 4)
+        self.assertEqual(len(payload["csl_word_citations"]), 8)
+        self.assertEqual(len(payload["literature_inventory"]), 8)
         for cite in payload["csl_word_citations"]:
             self.assertIn("citationID", cite)
             self.assertIn("citationItems", cite)
@@ -92,7 +93,7 @@ class TestARTAZoteroReviewPipeline(unittest.TestCase):
             self.assertTrue(Path(result["ppt_path"]).exists())
             self.assertTrue(Path(result["bib_path"]).exists())
             self.assertTrue(Path(result["ris_path"]).exists())
-            self.assertEqual(result["items_count"], 4)
+            self.assertEqual(result["paper_count"], 8)
 
 
 if __name__ == "__main__":
