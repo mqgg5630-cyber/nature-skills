@@ -12,6 +12,7 @@
 - [四、 独立测试与交付产物验证](#四-独立测试与交付产物验证)
 - [五、 分步组装与一键运行指南](#五-分步组装与一键运行指南)
 - [六、 分支同步与本地 Git 代码拉取](#六-分支同步与本地-git-代码拉取)
+- [七、 Gmail + Spark + Zotero 10篇累积式自动触发综述设计](#七-gmail--spark--zotero-10篇累积式自动触发综述设计)
 
 ---
 
@@ -178,3 +179,23 @@ git fetch origin arena/01a088f7-nature-skills
 git checkout -b arena/01a088f7-nature-skills origin/arena/01a088f7-nature-skills
 git pull origin arena/01a088f7-nature-skills
 ```
+
+---
+
+## 七、 Gmail + Spark + Zotero 10篇累积式自动触发综述设计
+
+### 7.1 可行性评估：极佳的“事件驱动+阈值批次”学术自动化架构
+你提出的“一边知网/Zotero抓取，一边推送到Gmail，每10篇由Spark/Daemon自动触发综述综合”的思路**完全可行，且非常科学**：
+1. **异步解耦**：平时在电脑/手机端检索文献，直接入库推邮箱，无需打断思路手动执行脚本；
+2. **黄金粒度**：10篇文献构成一个天然的“研究小集群（Mini-cluster）”，正好可以填满一张完整的科技三线对比表（表 1-1），并提炼出具有统计意义的技术路线演进；
+3. **增量演化（Iterative Review）**：每次触发不是推倒重来，而是将新 10 篇的量化指标和机制合并入大模型论证矩阵，动态更新第一章底本与答辩 PPT。
+
+### 7.2 运行与仿真测试
+我们在 `scripts/gmail_literature_trigger.py` 中实现了该累积触发器：
+```bash
+# 运行 10 篇文献自动累积与触发仿真
+python3 scripts/gmail_literature_trigger.py --test-mode --batch-size 10
+```
+- **队列管理**：状态持久化存储于 `outputs/accumulator_state.json`；
+- **批次触发**：第 1~9 篇静默排队，第 10 篇入队瞬间自动唤醒 ARTA 综述引擎，输出对应批次的交付物至 `outputs/gmail_simulation/batch_N/`。
+
