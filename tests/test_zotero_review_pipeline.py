@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the Zotero Review Pipeline."""
+"""Unit tests for the ARTA-Compatible Zotero Literature Review Pipeline."""
 
 import json
 import tempfile
@@ -10,86 +10,89 @@ import sys
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from zotero_review_pipeline import (
-    ZoteroConnector,
-    ZoteroItem,
+    ZoteroLocalConnector,
+    PaperItem,
+    ThesisStudentInfo,
     PDFExtractor,
-    PaperCardExtractor,
-    SCIReviewSynthesizer,
-    ReferenceVerifier,
-    run_pipeline,
+    PaperCardBuilder,
+    ARTAThesisSynthesizer,
+    run_arta_pipeline,
 )
 
 
-class TestZoteroReviewPipeline(unittest.TestCase):
+class TestARTAZoteroReviewPipeline(unittest.TestCase):
     def setUp(self):
-        self.connector = ZoteroConnector()
-        self.mock_items = self.connector.fetch_items_mock("Solid-State Batteries")
+        self.connector = ZoteroLocalConnector()
+        self.mock_items = self.connector.fetch_items("鲜味肽机器学习筛选", test_mode=True)
+        self.student = ThesisStudentInfo()
 
-    def test_mock_items_structure(self):
-        self.assertGreaterEqual(len(self.mock_items), 4)
+    def test_paper_items_structure(self):
+        self.assertEqual(len(self.mock_items), 4)
         for item in self.mock_items:
-            self.assertTrue(item.cite_key)
+            self.assertTrue(item.item_key)
             self.assertTrue(item.title)
             self.assertTrue(item.doi)
-            self.assertTrue(item.abstract)
+            self.assertTrue(item.csl_json)
+            self.assertTrue(item.uri)
 
-    def test_paper_card_extraction(self):
+    def test_paper_card_builder(self):
         item = self.mock_items[0]
-        card = PaperCardExtractor.create_card(item)
-        self.assertEqual(card.cite_key, item.cite_key)
-        self.assertIn("Chemo-mechanical", card.problem_statement)
+        card = PaperCardBuilder.build(item)
+        self.assertEqual(card.item_key, item.item_key)
+        self.assertIn("可解释性", card.problem_statement)
         self.assertGreater(len(card.quantitative_findings), 0)
         self.assertTrue(card.proposed_mechanism)
         self.assertTrue(card.limitations_and_boundary)
 
-    def test_evidence_matrix_generation(self):
-        cards = [PaperCardExtractor.create_card(it) for it in self.mock_items]
-        matrix_md = SCIReviewSynthesizer.generate_evidence_matrix_markdown(cards)
-        self.assertIn("Cross-Study Evidence & Performance Matrix", matrix_md)
+    def test_three_line_table_generation(self):
+        cards = [PaperCardBuilder.build(it) for it in self.mock_items]
+        table_md = ARTAThesisSynthesizer.generate_three_line_table_markdown(cards)
+        self.assertIn("表 1-1", table_md)
         for card in cards:
-            self.assertIn(f"[{card.cite_key}]", matrix_md)
+            self.assertIn(f"[{card.item_key}]", table_md)
 
-    def test_synthesize_review_manuscript(self):
-        cards = [PaperCardExtractor.create_card(it) for it in self.mock_items]
-        manuscript = SCIReviewSynthesizer.synthesize_review_manuscript(
-            topic="Solid-State Lithium Batteries", cards=cards
-        )
-        self.assertIn("1. Introduction and Thematic Scope", manuscript)
-        self.assertIn("2. Fundamental Mechanisms Governing Solid-Solid Interfaces", manuscript)
-        self.assertIn("4. Synthesis of Controversies, Conflicting Results, and Research Gaps", manuscript)
-        self.assertIn("5. Strategic Roadmap and Future Research Horizons", manuscript)
+    def test_thesis_chapter1_synthesis(self):
+        cards = [PaperCardBuilder.build(it) for it in self.mock_items]
+        topic = "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
+        chapter1_md = ARTAThesisSynthesizer.synthesize_thesis_chapter1(topic, self.student, cards)
+        self.assertIn("# 第1章 绪论", chapter1_md)
+        self.assertIn("## 1.1 研究背景与重大科研意义", chapter1_md)
+        self.assertIn("## 1.2 食源性鲜味肽机器学习筛选模型研究进展", chapter1_md)
+        self.assertIn("## 1.3 人体鲜味受体 T1R1/T1R3 互作结构与分子呈味机制", chapter1_md)
+        self.assertIn("## 1.5 本文研究内容与章节架构", chapter1_md)
 
-    def test_citation_verification_and_bibtex(self):
+    def test_arta_dual_track_payload(self):
+        cards = [PaperCardBuilder.build(it) for it in self.mock_items]
+        topic = "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
+        payload = ARTAThesisSynthesizer.generate_arta_synthesis_payload(topic, self.student, self.mock_items, cards)
+        self.assertEqual(payload["project_metadata"]["topic"], topic)
+        self.assertEqual(len(payload["csl_word_citations"]), 4)
+        self.assertEqual(len(payload["literature_inventory"]), 4)
+        for cite in payload["csl_word_citations"]:
+            self.assertIn("citationID", cite)
+            self.assertIn("citationItems", cite)
+
+    def test_arta_ppt_deck_payload(self):
+        cards = [PaperCardBuilder.build(it) for it in self.mock_items]
+        topic = "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
+        ppt_payload = ARTAThesisSynthesizer.generate_arta_ppt_deck_payload(topic, self.student, cards)
+        self.assertEqual(len(ppt_payload["slides"]), 6)
+        self.assertGreaterEqual(ppt_payload["deck_metadata"]["typography_rules"]["body_min_pt"], 18)
+        self.assertGreaterEqual(ppt_payload["deck_metadata"]["typography_rules"]["title_pt"], 28)
+
+    def test_end_to_end_arta_pipeline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            cards = [PaperCardExtractor.create_card(it) for it in self.mock_items]
-            manuscript = SCIReviewSynthesizer.synthesize_review_manuscript(
-                topic="Solid-State Lithium Batteries", cards=cards
-            )
-
-            bib_path = tmp_path / "references.bib"
-            ReferenceVerifier.export_bibtex(self.mock_items, bib_path)
-            self.assertTrue(bib_path.exists())
-
-            bib_content = bib_path.read_text()
-            for it in self.mock_items:
-                self.assertIn(it.cite_key, bib_content)
-
-            verification = ReferenceVerifier.verify_citations(manuscript, self.mock_items)
-            self.assertTrue(verification["passed"])
-            self.assertEqual(verification["unresolved_count"], 0)
-            self.assertEqual(verification["verified_count"], len(self.mock_items))
-
-    def test_end_to_end_run(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = run_pipeline(
+            result = run_arta_pipeline(
                 test_mode=True,
-                query="Solid-State Lithium Batteries",
+                topic="基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析",
                 output_dir=tmpdir
             )
-            self.assertTrue(result["verification"]["passed"])
-            self.assertTrue(Path(result["manuscript_path"]).exists())
+            self.assertTrue(Path(result["chapter1_path"]).exists())
+            self.assertTrue(Path(result["payload_path"]).exists())
+            self.assertTrue(Path(result["ppt_path"]).exists())
             self.assertTrue(Path(result["bib_path"]).exists())
+            self.assertTrue(Path(result["ris_path"]).exists())
+            self.assertEqual(result["items_count"], 4)
 
 
 if __name__ == "__main__":

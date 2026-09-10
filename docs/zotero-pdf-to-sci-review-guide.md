@@ -1,195 +1,180 @@
-# 基于 Zotero 真实 PDF 文献的 SCI 顶刊综述生成指南与全流程工作流
+# ARTA (Academic-Review-Thesis-Agent) 协同架构与 Zotero 综述生成全流程指南
 
-> 本文档由 **Nature Skills** 团队针对 Zotero + 知网/SCI PDF 全文提取、结构化证据链梳理与顶刊级综述论文写作全流程编写。
+> 本指南针对用户现有的 **ARTA (Academic-Review-Thesis-Agent)** 智能体架构、Zotero 本地活体 23119 通信层、`DualTrackWordCompiler` 双轨 Word 编译层、`LarkThesisFormatter` 高校毕业论文排版层及 `PPTRouter` 演示文稿调度层进行深度适配与无缝组装。
 
 ---
 
 ## 目录
 
-- [1. 综述写作的开源仓库、MCP 与 Skills 生态](#1-综述写作的开源仓库mcp-与-skills-生态)
-- [2. 学术 PDF 全面读取的选型与最佳实践](#2-学术-pdf-全面读取的选型与最佳实践)
-- [3. 基于真实 PDF 内容生成科研 SCI 综述的标准流程（防幻觉）](#3-基于真实-pdf-内容生成科研-sci-综述的标准流程防幻觉)
-- [4. 写综述推荐的 Skills 组合与分工](#4-写综述推荐的-skills-组合与分工)
-- [5. 独立测试与集成步骤（从单模块测试到全面组装）](#5-独立测试与集成步骤从单模块测试到全面组装)
-- [6. 分支同步与本地 Git 克隆指令](#6-分支同步与本地-git-克隆指令)
+- [一、 ARTA 现有架构与本方案的适配性评估](#一-arta-现有架构与本方案的适配性评估)
+- [二、 核心数据契约与接口无缝映射 (Data Contracts)](#二-核心数据契约与接口无缝映射-data-contracts)
+- [三、 全流程分层执行架构](#三-全流程分层执行架构)
+- [四、 独立测试与交付产物验证](#四-独立测试与交付产物验证)
+- [五、 分步组装与一键运行指南](#五-分步组装与一键运行指南)
+- [六、 分支同步与本地 Git 代码拉取](#六-分支同步与本地-git-代码拉取)
 
 ---
 
-## 1. 综述写作的开源仓库、MCP 与 Skills 生态
+## 一、 ARTA 现有架构与本方案的适配性评估
 
-要基于 Zotero 中带有真实 PDF 的文献库（如通过知网 CNKI 插件或 Jasmine / Translators 导入的论文）生成高水平 SCI 综述，核心不能依赖“大模型自由发挥”，而必须建立在**事实提取（Fact Extraction）与证据链锚定（Evidence Grounding）**之上。
+### 1.1 适配结论：天然契合，补齐最核心的“事实化语义合成”短板
+你的 ARTA 架构具备极其顶级的工程底座：
+- **S1 / S2** 负责知网/SCI捕获与 Zotero 23119 端口批量活体入库；
+- **S4** `DualTrackWordCompiler` 负责 `ADDIN ZOTERO_ITEM` 复杂域与 `custom.xml` 零 Refresh 活体编译；
+- **S5** `LarkThesisFormatter` 负责以鲁东大学等标杆模板进行高校法定排版；
+- **S6** `PPTRouter` 负责 6 大仓库多主题 PPT 演示文稿生成。
 
-### 1.1 本仓库 `nature-skills`（专为顶刊 SCI 设计）
-本仓库收录了面向 Nature / Science 及各顶刊标准的全套科研 Skills：
-- **`nature-literature-pipeline`**：全自动文献流水线与**集中综述编译工作流**（`references/review-compilation-workflow.md`），涵盖存量盘点、空白填补、受众过滤到 7 节架构设计。
-- **`nature-paper-card`**：单篇文献深度精读生成 01–16 节的 Paper Card（提取研究问题、实验系统、量化数据、机理解释、结论边界与局限性），是杜绝幻觉的基石。
-- **`nature-reader`**：带原文来源锚点、双语对照、公式与图表精确保留的全文深度解析器。
-- **`nature-writing`（`paper_type: review`）**：严格遵循顶刊综述论证链（`Scope -> Organizing Principle -> Thematic Synthesis -> Disagreements & Gaps -> Author Stance -> Outlook`），彻底摒弃流水账罗列。
-- **`nature-citation` & `nature-ref-verifier`**：多源交叉核验引用真实性，防止捏造 DOI、作者或卷期。
-- **`nature-figure`**：用于绘制综述核心的自绘机理概念图（Class A）与跨研究对比热力/柱状图。
-- **`nature-polishing`**：Nature 级学术语言润色与逻辑连接词校正。
-
-### 1.2 外部协作 MCP 与开源工具
-- **`zotero-mcp` / `mcp-server-zotero`**：连接本地 Zotero 7 或 Web API，实现条目检索、标签筛选、PDF 附件路径获取和笔记提取。
-- **`MinerU (Magic-PDF)` / `Marker`**：业界领先的开源学术 PDF 版面分析工具，支持双栏、公式 LaTeX 化与复杂表格 Markdown 化。
+**本方案在 ARTA 中扮演 S3 智能综述合成层（Synthesis Engine）的核心大脑**：
+1. **彻底解决大模型写综述的“空泛与幻觉”**：将从知网/SCI 下载的双栏 PDF 通过版面分析，提炼为具有量化指标（如准确率 93.4%、结合自由能 -8.5 kcal/mol）与页码锚点的结构化 Paper Cards。
+2. **直出标准科技三线表（Table 1-1）**：生成包含模型算法、性能指标、分子构效机制与局限性的学术三线表。
+3. **完美对接模式一高校多级编号**：直接输出高校毕业论文“第1章 绪论（1.1, 1.2, 1.2.1）”标准格式，并携带真实的 Zotero `[UMAMI_001]` 引用标识。
+4. **生成 PPTRouter 专属 Payload**：严格遵循你设定的字号阶梯规范（正文 $\ge 18\text{pt}$、重点 $\ge 20\text{pt}$、标题 $\ge 28\text{pt}$），直通 Dashi-PPT、PPT-Master 与 Cyber-PPT。
 
 ---
 
-## 2. 学术 PDF 全面读取的选型与最佳实践
+## 二、 核心数据契约与接口无缝映射 (Data Contracts)
 
-学术论文 PDF（尤其是知网双栏 PDF 和国外 Elsevier / Springer / Nature 排版）具有双栏混排、跨页表格、嵌入式公式、Figure Caption 混排等复杂特性。
+本方案输出的中间结构与 ARTA 各模块完全对齐：
 
-### 2.1 常见的四级读取解析方案
-
-| 方案级别 | 核心技术 / 工具 | 优势 | 适用场景 |
-|---|---|---|---|
-| **Level 1: 学术版面分析引擎（推荐首选）** | **MinerU (Magic-PDF)** / **Marker** / **Grobid** | 完美还原双栏阅读顺序、精准提取三线表为 Markdown、公式转标准 LaTeX、自动切割图表与 Caption | 需要高精度提取正文、数学公式、表格数据与实验参数时 |
-| **Level 2: 几何流式 Python 本地引擎** | **PyMuPDF (`fitz`)** + 正则状态机（本仓库 `prepare_paper.py` & `zotero_review_pipeline.py`） | 极轻量、无需重型深度学习依赖、提取速度毫秒级、精确到页面与几何块 | 批量扫描大量 PDF、快速抽取 IMRAD 章节与图表 Captions |
-| **Level 3: 多模态视觉模型（VLM）** | **Claude 3.7 / GPT-4o / Qwen-VL** + 逐页高清渲染 | 语义理解最强，能直接看懂复杂的工艺流程图、机理示意图和扫描版 PDF | 针对核心突破论文的重点图表进行多模态机理解析 |
-| **Level 4: Zotero 原生划线与笔记提取** | Zotero 7 内置 PDF 全文索引 + Annotations Export | 包含研究者本人的精读高亮、标签与批注，信息密度极高 | 结合人工筛选的重点段落进行快速合成 |
-
-### 2.2 推荐的读取实施标准
-1. **优先提取结构化章节**：将 PDF 分割为 `Abstract`、`Introduction`、`Methods`、`Results`、`Discussion`、`Conclusion`，而不是一股脑将整篇纯文本喂给大模型。
-2. **提取图表 Caption 索引**：学术综述中 70% 的核心量化结论都浓缩在 Figure 和 Table 的图注中。
-3. **保留页码锚点（Page Anchors）**：提取时强制记录 `pdf_page`，确保后续写综述时每一句话都能溯源到 PDF 的具体页码和图表编号。
-
----
-
-## 3. 基于真实 PDF 内容生成科研 SCI 综述的标准流程（防幻觉）
-
-高质量 SCI 综述的核心原则是：**“先做事实提取与对比矩阵（Evidence Matrix），再做主题式综合分析（Thematic Synthesis），绝不让模型直接无约束写作。”**
-
-```
- ┌─────────────────────────────────────────────────────────────┐
- │                Zotero 本地库 / 知网 PDF 文献               │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ ① 检索与附件定位 (Zotero Connector / MCP)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │            PDF 结构化解析 (PyMuPDF / MinerU 提取)           │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ ② 01-16 节事实卡片化 (nature-paper-card)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │         结构化文献事实库 (Paper Cards + 证据锚点)          │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ ③ 横向对比与争议/空白识别 (nature-literature-pipeline)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │         跨研究证据对比矩阵 (Cross-Study Evidence Matrix)    │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ ④ 7 节因果驱动顶刊大纲 (nature-writing: review)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │          SCI 综述草稿起草 (主题对比论证，严禁流水账)         │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ ⑤ 引用多源交叉验证 (nature-ref-verifier)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │     高质量 SCI 综述产物 (.md) + 标准 BibTeX + 零幻觉报告    │
- └─────────────────────────────────────────────────────────────┘
+### 2.1 对接 S4 `DualTrackWordCompiler` 的 CSL 引用契约
+```json
+{
+  "citationID": "CITE_UMAMI_001",
+  "citationIndex": 1,
+  "citationItems": [
+    {
+      "id": "UMAMI_001",
+      "uri": ["http://zotero.org/users/local/items/UMAMI_001"],
+      "itemData": {
+        "id": "UMAMI_001",
+        "type": "article-journal",
+        "title": "iUmami-SCM: Mining Sequence Characteristics...",
+        "container-title": "Journal of Proteome Research",
+        "DOI": "10.1021/acs.jproteome.0c00684",
+        "author": [{"family": "Charoenkwan", "given": "Prasit"}]
+      }
+    }
+  ],
+  "properties": {
+    "formattedCitation": "[1]",
+    "plainCitation": "[1]",
+    "customXmlTarget": "docProps/custom.xml"
+  }
+}
 ```
 
-### 步骤详解：
+### 2.2 对接 S5 `LarkThesisFormatter` 的学位论文 Markdown 格式
+- 采用 **模式一多级编号**（第1章 绪论、1.1、1.2、1.2.1）。
+- 嵌入标准科技三线表（Markdown 自动解析为 Word 顶线 1.5pt、底线 1.5pt、栏目线 0.75pt）。
+- 正文段落包含学生学籍、课题名称与各章节规划。
 
-#### 步骤一：单篇文献事实卡片化（Paper Card Extraction）
-从每篇 PDF 抽取 6 个核心要素：
-1. **研究痛点与核心科学问题**（Research Problem）
-2. **实验材料与方法体系**（Materials & Methods）
-3. **关键量化指标**（Quantitative Metrics，包含精确数值、测试条件）
-4. **提出的物理/化学机制**（Proposed Mechanism）
-5. **适用边界与局限性**（Limitations & Boundary Conditions）
-6. **来源证据锚点**（Figure/Table/Page 编号）
-
-#### 步骤二：构建横向对比矩阵（Evidence Matrix）
-将多篇文献汇总成 Markdown 表格，横向比对不同流派、不同机理、不同性能的优劣，找出：
-- **领域共识（Consensus）**
-- **学术争议与矛盾（Contradictions/Disagreements）**：例如“为什么研究 A 认为掺杂能提高稳定性，而研究 B 却报告发生了相分离？”
-- **研究空白（Research Gaps）**：例如目前所有工作均集中在室温，高温恶劣工况下数据缺失。
-
-#### 步骤三：7 节顶刊论证架构（Narrative Architecture）
-顶刊综述的标准篇幅分布与逻辑链：
-1. **§1 Introduction & Thematic Scope (~8%)**：从大背景漏斗式引出核心矛盾与本综述的主题边界。
-2. **§2 Fundamental Mechanisms (~13%)**：底层物理/化学反应原理。
-3. **§3 Material & Methodology Taxonomy (~17%)**：材料分类、合成路线或算法架构对比。
-4. **§4 Core Degradation / Bottlenecks / Controversies (~30% ★核心)**：深入剖析核心瓶颈与争议焦点（篇幅最大、信息密度最高）。
-5. **§5 Modulation & Engineering Strategies (~13%)**：界面调控、改性手段或优化方案。
-6. **§6 Advanced Characterization & In-Situ Methods (~10%)**：先进表征与计算方法学。
-7. **§7 Strategic Roadmap & Outlook (~10%)**：提出领域未来的关键挑战、可检验假设与发展路线图。
-
-#### 步骤四：主题驱动的对比式起草（Thematic Drafting）
-- **严禁流水账**：绝对避免 `Author A reported X. Author B reported Y.`
-- **采用机理/现象驱动的综合句式**：
-  > *"While in-situ Raman spectroscopy by Wang et al. [Wang2023] demonstrated that crosslinked networks deflect dendrites at 60 °C, subsequent cryogenic TEM investigations by Zhang et al. [Zhang2024] revealed that localized interfacial shear stress above 70% SOC triggers void accumulation, suggesting that mechanical stiffness alone cannot accommodate dynamic lattice contraction."*
-
-#### 步骤五：多源引用核验（Ref Verification）
-通过 `nature-ref-verifier` 对综述中出现的全部 `[CiteKey]` 进行核对，确保 100% 对应 Zotero 中的真实文献，导出可直接导入 Zotero 的 `.bib` 文件。
+### 2.3 对接 S6 `PPTRouter` 的答辩幻灯片契约
+- 输出 6 页黄金结构（Hero 封面、痛点与背景、多维特征工程、多模型性能对比、T1R1/T1R3 受体构效、未来展望）。
+- 强制注入字体阶梯规则：`body_min_pt: 18`, `title_pt: 32`。
 
 ---
 
-## 4. 写综述推荐的 Skills 组合与分工
+## 三、 全流程分层执行架构
 
-| 阶段 | 推荐使用的 Skill | 核心职责 |
-|---|---|---|
-| **1. 文献整理与空白识别** | `nature-literature-pipeline` | 运行综述编译工作流，盘点存量、识别子方向空白 |
-| **2. 单篇 PDF 精读与卡片化** | `nature-paper-card` / `nature-reader` | 解析双栏 PDF，提取 01-16 节 Paper Card 与公式图表 |
-| **3. 综述大纲与正文起草** | `nature-writing` (`paper_type: review`) | 建立 7 节漏斗式论证链，执行主题对比写作 |
-| **4. 综述机理图表规划** | `nature-figure` | 规划 Class A 自绘机理流程图与 Class B 引用图表 |
-| **5. 引用交叉验证与查重** | `nature-ref-verifier` / `nature-citation` | 逐条核验作者、年份、DOI、页码，杜绝错引漏引 |
-| **6. 顶刊语言与语气润色** | `nature-polishing` | 提升学术英语言语严谨度，消除中式英语与冗余 |
+```mermaid
+flowchart TD
+    subgraph S1_S2 [S1 & S2: Ingestion & Zotero Connector]
+        A1[知网 / SCI PDF 附件] --> A2[ZoteroLocalConnector 23119]
+        A2 --> A3[提取 Item Key & CSL-JSON]
+    end
+
+    subgraph S3 [S3: Nature-Skills 智能综述合成引擎]
+        A3 --> B1[PyMuPDF / MinerU 版面解析]
+        B1 --> B2[01-16 节 Paper Card 证据提炼]
+        B2 --> B3[表 1-1 科技三线对比表]
+        B2 --> B4[第1章 绪论综述撰写 模式一]
+    end
+
+    subgraph S4_S5_S6 [S4, S5 & S6: ARTA 后端消费层]
+        B3 & B4 --> C1[arta_synthesis_payload.json]
+        C1 --> D1[DualTrackWordCompiler 活体编译]
+        D1 --> D2[LarkThesisFormatter 鲁东大学模板排版]
+        
+        B2 --> C2[arta_ppt_payload.json]
+        C2 --> E1[PPTRouter 调度引擎]
+        E1 --> E2[Dashi-PPT / PPT-Master 答辩幻灯片]
+    end
+```
 
 ---
 
-## 5. 独立测试与集成步骤（从单模块测试到全面组装）
+## 四、 独立测试与交付产物验证
 
-我们在本仓库中提供了开箱即用的测试脚本 `scripts/zotero_review_pipeline.py`。
+我们在本地完成了全套中间件的独立测试，脚本完全自洽且支持无外网、无 Zotero 进程时的沙箱模拟。
 
-### 5.1 第一步：执行独立测试（无需配置即可运行）
-在终端运行：
+### 4.1 运行独立测试指令
 ```bash
+# 运行端到端测试
 python3 scripts/zotero_review_pipeline.py --test-mode
-```
 
-**测试效果**：
-1. 自动加载模拟的真实 SCI/知网文献数据集。
-2. 解析文献核心事实，生成 `outputs/review_test/paper_cards.json`。
-3. 构建跨研究横向证据对比矩阵。
-4. 综合生成一份标准的 SCI 综述草稿 `outputs/review_test/review_draft.md`。
-5. 导出标准 BibTeX 文件 `outputs/review_test/references.bib`。
-6. 执行引用核验并输出 `outputs/review_test/verification_report.md`。
-
-运行单元测试套件：
-```bash
+# 运行自动化单元测试套件
 python3 -m unittest tests/test_zotero_review_pipeline.py
 ```
 
-### 5.2 第二步：连接本地 Zotero 客户端或本地 PDF 文件夹
-当独立测试验证成功后，你可以将你的真实 Zotero 附件或 PDF 文件夹连接进来：
-
-- **方式 A：直接传入存放 PDF 的本地文件夹**
-  ```bash
-  python3 scripts/zotero_review_pipeline.py --pdf-dir /path/to/your/cnki_pdfs --query "Your Review Topic"
-  ```
-
-- **方式 B：直接指定 Zotero 数据目录（自动遍历 storage 附件）**
-  ```bash
-  python3 scripts/zotero_review_pipeline.py --zotero-dir ~/Zotero --query "Your Review Topic"
-  ```
+### 4.2 独立测试生成的 5 大核心产物（位于 `outputs/arta_test/`）
+1. **`thesis_chapter1_review.md`**：学位论文第一章综述完整底本，严格遵循模式一编号，包含 4 篇鲜味肽真实核心文献的定量事实与机制解析。
+2. **`arta_synthesis_payload.json`**：供 ARTA `DualTrackWordCompiler` 读取的活体数据，包含 4 组精确的 CSL JSON 域代码。
+3. **`arta_ppt_payload.json`**：供 `PPTRouter` 生成 6 页答辩幻灯片的标准 JSON（字号严格 $\ge 18\text{pt}$）。
+4. **`references.bib`**：标准 BibTeX 格式文献库。
+5. **`references.ris`**：标准 RIS 格式文献库。
 
 ---
 
-## 6. 分支同步与本地 Git 克隆指令
+## 五、 分步组装与一键运行指南
 
-本次所有代码、工具脚本、测试用例与综述编写指南已同步推送至当前会话专属分支 `arena/01a088f7-nature-skills`。
+当独立测试验证通过后，将本脚本组装到你的 ARTA 工作流非常简单：
 
-### 本地克隆本分支指令：
+### 1. 连接本地真实 Zotero 23119 端口
+```bash
+python3 scripts/zotero_review_pipeline.py --zotero-port 23119 --topic "基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析"
+```
+
+### 2. 或者直接传入知网 PDF 文件夹
+```bash
+python3 scripts/zotero_review_pipeline.py --pdf-dir E:/my_cnki_pdfs --topic "食源性鲜味肽高通量筛选"
+```
+
+### 3. 在你的 ARTA `arta_agent.py` 中直接导入调用：
+```python
+import json
+from scripts.zotero_review_pipeline import run_arta_pipeline
+
+# 1. 运行智能综述提取引擎
+results = run_arta_pipeline(
+    test_mode=False,
+    zotero_port=23119,
+    topic="基于机器学习的食源性鲜味肽高通量筛选与呈味机制解析",
+    output_dir="e:/my_thesis_project/arta_output"
+)
+
+# 2. 读取输出 payload 并灌入 DualTrackWordCompiler 和 PPTRouter
+with open(results["payload_path"], "r", encoding="utf-8") as f:
+    synthesis_payload = json.load(f)
+
+# 3. 驱动现有的 LarkThesisFormatterAdapter 生成最终 .docx
+# 4. 驱动现有的 PPTRouter 生成最终答辩 .pptx
+```
+
+---
+
+## 六、 分支同步与本地 Git 代码拉取
+
+本次适配修改已经全部测试通过并推送至远程专属分支 **`arena/01a088f7-nature-skills`**。
+
+### 本地克隆或拉取本分支的代码：
 ```bash
 git clone -b arena/01a088f7-nature-skills https://github.com/mqgg5630-cyber/nature-skills.git
 cd nature-skills
 ```
 
-### 如果本地已有仓库，切换并拉取本分支：
+如果本地已经有该仓库：
 ```bash
+git fetch origin arena/01a088f7-nature-skills
 git checkout -b arena/01a088f7-nature-skills origin/arena/01a088f7-nature-skills
 git pull origin arena/01a088f7-nature-skills
 ```
