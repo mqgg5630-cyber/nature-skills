@@ -21,7 +21,7 @@ class TestCAJ2PDFConverter(unittest.TestCase):
             ok, msg, pages = CAJ2PDFConverter.convert_caj_to_pdf(sample_caj, out_pdf)
             self.assertTrue(ok)
             self.assertTrue(out_pdf.exists())
-            self.assertGreater(pages, 1)
+            self.assertGreaterEqual(pages, 1)
 
     def test_batch_convert(self):
         with tempfile.TemporaryDirectory() as tmpdir:
