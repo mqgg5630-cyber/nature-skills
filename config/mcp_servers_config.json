@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "zotero": {
+      "command": "node",
+      "args": ["E:/0mcp-agv/mcp-servers/zotero-mcp/build/index.js"],
+      "env": {
+        "ZOTERO_PORT": "23119",
+        "ZOTERO_HOST": "127.0.0.1"
+      }
+    },
+    "word": {
+      "command": "python",
+      "args": ["-m", "mcp_server_word"],
+      "env": {
+        "WORD_WORKSPACE": "E:/0mcp-agv/ARTA_Agent_Output"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "E:/0mcp-agv", "E:/0writing", "E:/spider"]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-playwright"]
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "pymol_mcp": {
+      "command": "python",
+      "args": ["E:/0mcp-agv/mcp-servers/pymol-mcp/server.py"],
+      "env": {
+        "PYMOL_PATH": "C:/Program Files/PyMOL/PyMOLWin.exe"
+      }
+    },
+    "illustrator": {
+      "command": "node",
+      "args": ["E:/0mcp-agv/mcp-servers/illustrator-mcp/index.js"]
+    },
+    "searxng": {
+      "command": "node",
+      "args": ["E:/0mcp-agv/mcp-servers/searxng-mcp/index.js"],
+      "env": {
+        "SEARXNG_URL": "http://127.0.0.1:8080"
+      }
+    }
+  }
+}

@@ -102,6 +102,8 @@ A config template is provided in `templates/literature-push-template.md`.
 | `references/push-format.md` | Daily digest message template with field guidelines and example |
 | `references/cron-setup.md` | Cron job creation, verification, and manual fallback procedures |
 | `references/review-compilation-workflow.md` | End-to-end workflow for concentrated literature review writing |
+| `references/arta-integration.md` | Integration bridge with ARTA (Academic-Review-Thesis-Agent), Zotero 23119, Word CSL compiler, and PPTRouter |
+
 
 ## Pitfalls
 

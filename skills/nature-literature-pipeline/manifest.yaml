@@ -32,3 +32,6 @@ references:
       path: references/cron-setup.md
     - condition: compiling multiple daily notes into a literature review, related-work section, or concentrated reading report
       path: references/review-compilation-workflow.md
+    - condition: integrating with ARTA (Academic-Review-Thesis-Agent), Zotero 23119 live connector, DualTrackWordCompiler, LarkThesisFormatter, or PPTRouter
+      path: references/arta-integration.md
+

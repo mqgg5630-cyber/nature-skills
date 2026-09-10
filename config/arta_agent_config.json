@@ -1,0 +1,73 @@
+{
+  "agent_name": "ARTA (Academic-Review-Thesis-Agent)",
+  "version": "2.0.0",
+  "description": "端到端全自动科研综述生成、高校学位论文法定排版与答辩演示文稿生成智能体",
+  "default_workspace": "E:/0mcp-agv",
+  "zotero_config": {
+    "local_port": 23119,
+    "host": "127.0.0.1",
+    "storage_dir": "C:/Users/%USERNAME%/Zotero/storage",
+    "csl_style": "china-national-standard-gb-t-7714-2015-numeric",
+    "auto_key_mapping": true
+  },
+  "pipeline_stages": {
+    "S1_ingestion": {
+      "enabled": true,
+      "sources": ["cnki", "crossref", "arxiv", "local_pdf"],
+      "skills": ["cnki-zotero-auto-ingest", "nature-academic-search"]
+    },
+    "S2_zotero_connector": {
+      "enabled": true,
+      "connector_type": "local_http_23119",
+      "mcp_server": "zotero",
+      "auto_tag": ["ARTA-Synthesized", "Umami-Peptides"]
+    },
+    "S3_synthesis_engine": {
+      "enabled": true,
+      "skills": [
+        "nature-paper-card",
+        "nature-reader",
+        "nature-literature-pipeline",
+        "nature-writing",
+        "nature-citation"
+      ],
+      "format_mode": "模式一多级编号 (第1章, 1.1, 1.2)",
+      "table_style": "标准科技三线表 (顶线1.5pt, 底线1.5pt, 栏目线0.75pt)",
+      "quality_audit": {
+        "min_quantitative_metrics_per_card": 2,
+        "require_source_anchors": true,
+        "require_limitations": true
+      }
+    },
+    "S4_dual_track_word_compiler": {
+      "enabled": true,
+      "skill": "zotero-academic-writer",
+      "mcp_server": "word",
+      "inject_addin_zotero_item": true,
+      "inject_custom_xml": true,
+      "zero_refresh_display": true
+    },
+    "S5_thesis_formatter": {
+      "enabled": true,
+      "skill": "lark-thesis-formatter",
+      "benchmark_template": "E:/0writing/Lark-Formatter/鲁东大学学术学位论文_Zotero活动引用版_new.docx",
+      "student_info": {
+        "school_name": "鲁东大学",
+        "school_code": "10451",
+        "degree_field": "食品科学与工程",
+        "degree_type": "硕士学位论文"
+      }
+    },
+    "S6_ppt_router": {
+      "enabled": true,
+      "default_engine": "ppt-master",
+      "fallback_engines": ["cyber-ppt", "dashi-ppt", "swiss-pptx", "guizang-ppt", "banana-slides"],
+      "typography_ladder": {
+        "title_pt": 32,
+        "section_focus_pt": 22,
+        "body_min_pt": 18
+      },
+      "vlm_audit": true
+    }
+  }
+}
