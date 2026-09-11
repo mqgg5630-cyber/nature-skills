@@ -297,3 +297,71 @@ python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
 
 > 说明：Gmail 没有真正的「服务端 push 到本机」能力（除非上 Google Cloud Pub/Sub + 公网回调），
 > IMAP IDLE 是免公网、免额外服务的最实时方案，延迟通常在数秒内。
+
+## 十三、让 Spark 处理邮箱里【已有】的 PDF（harvest）
+
+`watch` 只处理本系统自己发的、未读的 `[CNKI-INGEST]` 邮件。
+如果你邮箱里**早就躺着**一堆文献 PDF（导师转发的、自己存档的、其它工具发的），
+用新增的 `harvest` 子命令一次性回收——它扫描**任意邮件里的任意 PDF 附件**。
+
+### 第一步：先 dry-run 看清单（强烈建议）
+
+```powershell
+python scripts/gmail_cnki_bridge.py harvest --dry-run --newest-first --limit 50 `
+    --topic "食源性鲜味肽高通量筛选与呈味机制解析"
+```
+
+只列出「会收哪些附件、多大、来自哪封邮件」，**不落盘、不入库、不触发综述**。
+
+### 第二步：确认无误后正式收
+
+```powershell
+python scripts/gmail_cnki_bridge.py harvest --batch-size 10 --cnki-only `
+    --topic "食源性鲜味肽高通量筛选与呈味机制解析" `
+    --on-event "python scripts/spark_event_hook.py"
+```
+
+收够 `--batch-size` 篇会**立刻自动编译综述**并触发 `review_ready` 事件给 Spark。
+
+### 筛选参数
+
+| 参数 | 作用 |
+|---|---|
+| `--since 2025-01-01` / `--before 2026-01-01` | 按日期范围（自动转 IMAP 的 `01-Jan-2025` 格式） |
+| `--from prof@univ.edu` | 只收某个发件人的邮件（导师转发场景最常用） |
+| `--subject "CNKI"` | 主题关键词。**中文主题建议改用标签或发件人过滤**，IMAP 中文搜索有编码坑 |
+| `--folder "[Gmail]/All Mail"` | 扫全部邮件；也可填你自建的 Gmail 标签名 |
+| `--unseen-only` | 只看未读 |
+| `--cnki-only` | 只收中文/知网文献，过滤掉发票、说明书等无关 PDF |
+| `--limit 50` | 最多处理多少个附件，先小批量试水 |
+| `--newest-first` | 从最新邮件往回扫 |
+| `--mark-seen` | 处理完标记已读，方便下次增量 |
+
+### 三条安全保证
+
+1. **SHA-256 去重**：同一份 PDF 无论出现在几封邮件里都只入库一次，
+   已被 `watch` 收过的也不会重复计入批次（共用同一个 `index.json`）。
+2. **元数据兜底**：本系统发的回传件走精确解析；其它邮件则从**附件名 → 主题 → 发件日期**
+   依次推断标题和年份，中文附件名可直接用。
+3. **可重复执行**：`harvest` 幂等，多跑几次不会污染文献库；每次产出
+   `outputs/gmail_library/harvest_report.json` 供核对。
+
+### 典型用法：把导师半年内转发的文献全收了
+
+```powershell
+python scripts/gmail_cnki_bridge.py harvest `
+    --from "tutor@ldu.edu.cn" --since 2026-03-01 --cnki-only --mark-seen `
+    --batch-size 10 --topic "食源性鲜味肽高通量筛选与呈味机制解析" `
+    --on-event "python scripts/spark_event_hook.py --spark-cmd 'spark run review --payload {payload_path}' --only review_ready"
+```
+
+### 存量 + 增量的推荐组合
+
+```powershell
+# 1) 先把历史存量一次性收干净
+python scripts/gmail_cnki_bridge.py harvest --cnki-only --mark-seen --batch-size 10 --topic "…"
+
+# 2) 再挂上实时监听，以后新邮件秒级自动处理
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle --batch-size 10 --topic "…" `
+    --on-event "python scripts/spark_event_hook.py"
+```

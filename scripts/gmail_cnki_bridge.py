@@ -5,6 +5,8 @@ Gmail ↔ CNKI Literature Bridge (Nature-Skills Edition)
 把「只推知网文献到 Gmail → 下载知网 PDF 回传 Gmail → 攒够阈值自动生成综述」
 的完整闭环封装为一个脚本，四个子命令：
 
+  harvest    扫描邮箱里【已有】的 PDF 附件（任意邮件，非本系统发出的也行）→
+             落盘文献库 → 去重 → 累积 → 触发综述/Spark（历史文献一次性回收）
   doctor     环境体检（Python / Gmail 凭据 / Node 22+ / nature-downloader / 可选依赖）
   selftest   离线全链路仿真（无需网络、无需凭据）：
              任务单邮件构建 → 知网过滤 → PDF 附件回环 → 批次阈值触发综述
@@ -62,6 +64,7 @@ import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage, Message
 from email.header import decode_header, make_header
+from email import policy as email_policy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -503,12 +506,29 @@ def process_ingest_message(
     return {
         "status": "ingested",
         "item_key": entry["item_key"],
+        "title": entry["title"],
         "saved_path": str(saved_path),
+        # 与事件钩子字段对齐：Spark 侧统一读 pdf_path
+        "pdf_path": str(saved_path),
         "sha256": sha256,
         "queue_count": len(accumulator.queue),
         "review_triggered": bool(result),
         "review_result": result,
     }
+
+
+
+def parse_message_bytes(raw: bytes) -> EmailMessage:
+    """统一用 EmailMessage(policy=default) 解析原始邮件。
+
+    注意：email.message_from_bytes() 不传 policy 时返回的是 legacy Message，
+    没有 iter_parts() / get_body()，会让下游解析直接抛 AttributeError。
+    """
+    try:
+        return email.message_from_bytes(raw, policy=email_policy.default)
+    except Exception:
+        # 极端畸形邮件退回宽松解析，至少不让监听循环挂掉
+        return email.message_from_bytes(raw, policy=email_policy.compat32)
 
 
 def decode_mime_header(raw: str) -> str:
@@ -540,17 +560,17 @@ def watch_once(
             typ, hdr_data = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])")
             if typ != "OK" or not hdr_data or hdr_data[0] is None:
                 continue
-            header_msg = email.message_from_bytes(hdr_data[0][1])
+            header_msg = parse_message_bytes(hdr_data[0][1])
             subject = decode_mime_header(header_msg.get("Subject", ""))
             if not subject.startswith(INGEST_PREFIX):
                 continue
-            message_id = (header_msg.get("Message-ID") or "").strip() or f"uid:{uid.decode()}"
+            message_id = str(header_msg.get("Message-ID") or "").strip() or f"uid:{uid.decode()}"
             if message_id in processed:
                 continue
             typ, mdata = conn.fetch(uid, "(RFC822)")
             if typ != "OK" or not mdata or mdata[0] is None:
                 continue
-            full_msg = email.message_from_bytes(mdata[0][1])
+            full_msg = parse_message_bytes(mdata[0][1])
             report = process_ingest_message(full_msg, library_dir, accumulator, topic)
             report["message_id"] = message_id
             processed[message_id] = {"processed_at": time.strftime("%Y-%m-%d %H:%M:%S"), **report}
@@ -635,6 +655,180 @@ def imap_idle_wait(cfg: GmailConfig, folder: str = "INBOX", timeout: int = 600) 
     except Exception as exc:
         print(f"   ⚠️  IDLE 不可用，退回轮询: {exc}")
         return False
+
+
+
+# ---------------------------------------------------------------------------
+# harvest：把邮箱里【已有】的 PDF 收进来（不限于本系统发出的 [CNKI-INGEST] 邮件）
+# ---------------------------------------------------------------------------
+
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def to_imap_date(value: str) -> str:
+    """把 YYYY-MM-DD 转成 IMAP 需要的 DD-Mon-YYYY；已是该格式则原样返回。"""
+    value = value.strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", value)
+    if not m:
+        return value
+    y, mo, d = m.groups()
+    return f"{int(d):02d}-{MONTHS[int(mo) - 1]}-{y}"
+
+
+def build_search_criteria(args: argparse.Namespace) -> List[str]:
+    """按 --since/--before/--from/--subject/--unseen-only 组装 IMAP 搜索条件。"""
+    criteria: List[str] = []
+    if getattr(args, "unseen_only", False):
+        criteria.append("UNSEEN")
+    if getattr(args, "since", None):
+        criteria += ["SINCE", to_imap_date(args.since)]
+    if getattr(args, "before", None):
+        criteria += ["BEFORE", to_imap_date(args.before)]
+    if getattr(args, "sender", None):
+        criteria += ["FROM", args.sender]
+    if getattr(args, "subject", None):
+        criteria += ["SUBJECT", args.subject]
+    return criteria or ["ALL"]
+
+
+def extract_pdf_parts(msg: Message) -> List[Tuple[str, bytes]]:
+    """取出邮件里所有 PDF 附件（含 CAJ 会在上层另行处理），返回 [(文件名, 字节)]。"""
+    found: List[Tuple[str, bytes]] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        filename = decode_mime_header(part.get_filename() or "")
+        ctype = part.get_content_type()
+        if ctype == "application/pdf" or filename.lower().endswith(".pdf"):
+            payload = part.get_payload(decode=True)
+            if payload:
+                found.append((filename or "attachment.pdf", payload))
+    return found
+
+
+def entry_from_attachment(filename: str, subject: str, msg: Message) -> Dict[str, Any]:
+    """没有结构化元数据时，从附件名/主题/发件日期兜底推断条目信息。"""
+    stem = re.sub(r"\.pdf$", "", filename, flags=re.IGNORECASE).strip()
+    # 去掉常见的下载器前缀噪声
+    stem = re.sub(r"^(CNKI[_-]?\d+[_-]?|知网[_-]?)", "", stem).strip()
+    title = stem or subject.strip() or "未命名文献"
+    year = ""
+    date_hdr = str(msg.get("Date", "") or "")
+    ym = re.search(r"(19|20)\d{2}", stem) or re.search(r"(19|20)\d{2}", date_hdr)
+    if ym:
+        year = ym.group(0)
+    return normalize_entries([{
+        "title": title,
+        "year": year,
+        "source": "cnki" if CJK_RE.search(title) else "email-attachment",
+    }])[0]
+
+
+def harvest_once(
+    cfg: GmailConfig,
+    accumulator: LiteratureAccumulator,
+    library_dir: Path,
+    topic: str,
+    args: argparse.Namespace,
+) -> List[Dict[str, Any]]:
+    """扫描邮箱既有邮件，把所有 PDF 附件收进本地文献库并喂给累积器。
+
+    与 watch 的区别：
+      - watch 只处理未读的 [CNKI-INGEST] 邮件（本系统自己发的回传件）；
+      - harvest 处理【任意】符合筛选条件的邮件里的【任意】PDF 附件，
+        用于把你邮箱里早就存在的文献一次性纳入流水线。
+    """
+    library_dir.mkdir(parents=True, exist_ok=True)
+    processed = _load_json_file(library_dir / "processed_messages.json", {})
+    reports: List[Dict[str, Any]] = []
+    limit = getattr(args, "limit", 0) or 0
+
+    with imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port) as conn:
+        conn.login(cfg.email, cfg.app_password)
+        typ, _ = conn.select(args.folder, readonly=not getattr(args, "mark_seen", False))
+        if typ != "OK":
+            raise SystemExit(f"IMAP 选择文件夹失败: {args.folder}")
+        criteria = build_search_criteria(args)
+        print(f"   IMAP 搜索条件: {' '.join(criteria)}")
+        typ, data = conn.search(None, *criteria)
+        uids = (data[0] or b"").split()
+        print(f"   命中 {len(uids)} 封邮件，开始扫描 PDF 附件 …")
+
+        for uid in reversed(uids) if getattr(args, "newest_first", False) else uids:
+            if limit and len(reports) >= limit:
+                break
+            typ, mdata = conn.fetch(uid, "(RFC822)")
+            if typ != "OK" or not mdata or mdata[0] is None:
+                continue
+            msg = parse_message_bytes(mdata[0][1])
+            subject = decode_mime_header(msg.get("Subject", ""))
+            message_id = str(msg.get("Message-ID") or "").strip() or f"uid:{uid.decode()}"
+
+            pdfs = extract_pdf_parts(msg)
+            if not pdfs:
+                continue
+
+            # 本系统自己发的回传件走原有精确解析（元数据更全）
+            structured = parse_cnki_entries_from_message(msg)
+
+            for filename, pdf_bytes in pdfs:
+                if limit and len(reports) >= limit:
+                    break
+                entry = structured[0] if structured else entry_from_attachment(filename, subject, msg)
+
+                if getattr(args, "cnki_only", False) and not is_cnki_entry(entry):
+                    reports.append({"status": "skipped", "reason": "not_cnki",
+                                    "item_key": entry["item_key"], "title": entry["title"]})
+                    continue
+
+                sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+                index = _load_json_file(library_dir / "index.json", {})
+                if sha256 in index:
+                    reports.append({"status": "duplicate", "item_key": entry["item_key"],
+                                    "title": entry["title"], "sha256": sha256})
+                    continue
+
+                if getattr(args, "dry_run", False):
+                    reports.append({"status": "would_ingest", "item_key": entry["item_key"],
+                                    "title": entry["title"], "attachment": filename,
+                                    "size_kb": round(len(pdf_bytes) / 1024, 1), "subject": subject})
+                    continue
+
+                paper_dir = library_dir / entry["item_key"]
+                paper_dir.mkdir(parents=True, exist_ok=True)
+                saved_path = paper_dir / f"{entry['item_key']}.pdf"
+                saved_path.write_bytes(pdf_bytes)
+                index[sha256] = {
+                    "item_key": entry["item_key"],
+                    "title": entry["title"],
+                    "saved_path": str(saved_path),
+                    "source_subject": subject,
+                    "source_attachment": filename,
+                    "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                _save_json_file(library_dir / "index.json", index)
+
+                queued = QueuedPaper(
+                    item_key=entry["item_key"], title=entry["title"], authors=entry["authors"],
+                    year=entry["year"], journal=entry["journal"], doi=entry["doi"],
+                    abstract=entry["abstract"], received_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    pdf_path=str(saved_path), source="CNKI-Gmail-Harvest",
+                )
+                result = accumulator.add_paper(queued, topic=topic, output_dir=str(library_dir / "reviews"))
+                reports.append({
+                    "status": "ingested", "item_key": entry["item_key"], "title": entry["title"],
+                    "saved_path": str(saved_path), "pdf_path": str(saved_path), "sha256": sha256,
+                    "attachment": filename, "subject": subject,
+                    "queue_count": len(accumulator.queue),
+                    "review_triggered": bool(result), "review_result": result,
+                })
+
+            processed[message_id] = {"processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     "subject": subject, "pdf_count": len(pdfs)}
+            _save_json_file(library_dir / "processed_messages.json", processed)
+            if getattr(args, "mark_seen", False) and not getattr(args, "dry_run", False):
+                conn.store(uid, "+FLAGS", "\\Seen")
+    return reports
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +922,70 @@ def cmd_ingest(args: argparse.Namespace, cfg: GmailConfig) -> None:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     ok = sum(1 for e in report["entries"] if e["status"] in {"sent", "dry_run_saved"})
     print(f"🎉 [ingest] 完成: {ok}/{len(entries)} 成功。报告: {report_path}")
+
+
+
+def cmd_harvest(args: argparse.Namespace, cfg: GmailConfig) -> None:
+    """把邮箱里【已有】的 PDF 一次性收进流水线，并按需触发 Spark 与综述。"""
+    cfg.require()
+    library_dir = Path(args.library)
+    accumulator = LiteratureAccumulator(
+        state_file=str(library_dir / "accumulator_state.json"), batch_size=args.batch_size
+    )
+    print("=" * 72)
+    print(f"🧺 [harvest] 扫描 Gmail 既有邮件中的 PDF（{cfg.email} / {args.folder}）")
+    print(f"   主题: {args.topic} | 批次阈值: {args.batch_size} | 文献库: {library_dir.resolve()}")
+    if args.dry_run:
+        print("   模式: DRY-RUN（只列清单，不落盘、不入库、不触发综述）")
+    print("=" * 72)
+
+    hook_cmd = getattr(args, "on_event", None)
+    hook_url = getattr(args, "webhook", None)
+    reports = harvest_once(cfg, accumulator, library_dir, topic=args.topic, args=args)
+
+    counts: Dict[str, int] = {}
+    for r in reports:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        if r["status"] == "would_ingest":
+            print(f"   🔎 待收: {r['item_key']} 《{r['title'][:40]}》 [{r['size_kb']} KB] ← {r['attachment']}")
+        elif r["status"] == "ingested":
+            print(f"   📥 入库: {r['item_key']} 《{r['title'][:40]}》（队列 {r['queue_count']}/{args.batch_size}）")
+            fire_hook(hook_cmd, hook_url, {
+                "event": "paper_ingested", "topic": args.topic, "item_key": r["item_key"],
+                "title": r["title"], "pdf_path": r["pdf_path"], "queue_count": r["queue_count"],
+                "batch_size": args.batch_size, "library_dir": str(library_dir.resolve()),
+                "source": "harvest", "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            if r.get("review_triggered"):
+                res = r["review_result"]
+                print(f"   🎉 批次 #{res['batch_id']} 综述编译完成: {res['chapter1_path']}")
+                fire_hook(hook_cmd, hook_url, {
+                    "event": "review_ready", "topic": args.topic, "batch_id": res.get("batch_id"),
+                    "paper_count": res.get("paper_count"), "chapter1_path": res.get("chapter1_path"),
+                    "payload_path": res.get("payload_path"), "ppt_path": res.get("ppt_path"),
+                    "library_dir": str(library_dir.resolve()), "source": "harvest",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+        elif r["status"] == "duplicate":
+            print(f"   ⏭️  已存在（SHA-256 去重）: {r['item_key']} 《{r['title'][:36]}》")
+        else:
+            print(f"   ⏭️  跳过: {r.get('item_key', '?')} ({r.get('reason', r['status'])})")
+
+    report_path = library_dir / "harvest_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps({
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "topic": args.topic, "folder": args.folder, "dry_run": bool(args.dry_run),
+        "counts": counts, "reports": reports,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("=" * 72)
+    print(f"✅ [harvest] 完成: {counts or '无匹配附件'}")
+    remaining = max(0, args.batch_size - len(accumulator.queue))
+    if not args.dry_run:
+        print(f"   当前队列 {len(accumulator.queue)}/{args.batch_size}，再收 {remaining} 篇即自动出综述")
+    print(f"   报告: {report_path}")
+    print("=" * 72)
 
 
 def cmd_watch(args: argparse.Namespace, cfg: GmailConfig) -> None:
@@ -1033,6 +1291,24 @@ def main() -> None:
     p_watch.add_argument("--webhook", type=str, default=None,
                          help="事件发生时 POST 的 HTTP 回调地址（JSON body）")
 
+    p_harv = sub.add_parser("harvest", help="扫描邮箱里【已有】的 PDF 附件并入库（一次性历史回收）")
+    p_harv.add_argument("--folder", type=str, default="INBOX", help="IMAP 文件夹，如 INBOX / \"[Gmail]/All Mail\" / 自建标签")
+    p_harv.add_argument("--batch-size", type=int, default=10)
+    p_harv.add_argument("--topic", type=str, default="知网文献自动综述")
+    p_harv.add_argument("--library", type=str, default="outputs/gmail_library")
+    p_harv.add_argument("--since", type=str, default=None, help="起始日期 YYYY-MM-DD（含）")
+    p_harv.add_argument("--before", type=str, default=None, help="截止日期 YYYY-MM-DD（不含）")
+    p_harv.add_argument("--from", dest="sender", type=str, default=None, help="按发件人过滤")
+    p_harv.add_argument("--subject", type=str, default=None, help="按主题关键词过滤（建议用 ASCII，中文主题请改用标签/发件人过滤）")
+    p_harv.add_argument("--unseen-only", action="store_true", help="只看未读邮件")
+    p_harv.add_argument("--cnki-only", action="store_true", help="只收判定为知网/中文的文献，过滤其它 PDF")
+    p_harv.add_argument("--limit", type=int, default=0, help="最多处理多少个附件（0=不限）")
+    p_harv.add_argument("--newest-first", action="store_true", help="从最新邮件开始扫")
+    p_harv.add_argument("--mark-seen", action="store_true", help="处理完标记已读")
+    p_harv.add_argument("--dry-run", action="store_true", help="只列清单不落盘（强烈建议先跑一次）")
+    p_harv.add_argument("--on-event", type=str, default=None, help="事件钩子命令（同 watch）")
+    p_harv.add_argument("--webhook", type=str, default=None, help="事件 webhook（同 watch）")
+
     p_doctor = sub.add_parser("doctor", help="环境体检（Python/凭据/Node/下载器/可选依赖）")
     p_doctor.add_argument("--node", type=str, default="node")
     p_doctor.add_argument("--skill-dir", type=str, default=None)
@@ -1049,6 +1325,8 @@ def main() -> None:
         cmd_ingest(args, cfg)
     elif args.mode == "watch":
         cmd_watch(args, cfg)
+    elif args.mode == "harvest":
+        cmd_harvest(args, cfg)
     elif args.mode == "doctor":
         cmd_doctor(args, cfg)
     else:

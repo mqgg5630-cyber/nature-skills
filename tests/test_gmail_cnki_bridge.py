@@ -292,3 +292,202 @@ class TestEventHooks(unittest.TestCase):
         self.assertIn("--push-mode", out)
         self.assertIn("--on-event", out)
         self.assertIn("--webhook", out)
+
+
+class TestHarvest(unittest.TestCase):
+    """harvest：扫描邮箱既有 PDF 附件（离线，用假 IMAP 连接）。"""
+
+    def _msg(self, subject, filename, payload, sender="prof@univ.edu"):
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m["Subject"] = subject
+        m["From"] = sender
+        m["To"] = "me@gmail.com"
+        m["Message-ID"] = f"<{filename}@test>"
+        m["Date"] = "Mon, 01 Jun 2026 10:00:00 +0800"
+        m.set_content("正文")
+        m.add_attachment(payload, maintype="application", subtype="pdf", filename=filename)
+        return m
+
+    def _patch_imap(self, bridge, messages):
+        """用假的 IMAP4_SSL 顶替真实连接。"""
+        class FakeIMAP:
+            def __init__(self, *a, **k):
+                self.store_calls = []
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def login(self, *a): return ("OK", [b""])
+            def select(self, folder, readonly=False): return ("OK", [b"1"])
+            def search(self, charset, *criteria):
+                return ("OK", [b" ".join(str(i + 1).encode() for i in range(len(messages)))])
+            def fetch(self, uid, spec):
+                idx = int(uid) - 1
+                # utf8 policy：附件名含中文时避免 ASCII 折行编码报错
+                return ("OK", [(b"1", messages[idx].as_bytes(
+                    policy=messages[idx].policy.clone(utf8=True)))])
+            def store(self, uid, flag, val):
+                self.store_calls.append((uid, val)); return ("OK", [b""])
+        bridge.imaplib.IMAP4_SSL = FakeIMAP
+
+    def _args(self, bridge, **over):
+        import argparse as _a
+        base = dict(folder="INBOX", since=None, before=None, sender=None, subject=None,
+                    unseen_only=False, cnki_only=False, limit=0, newest_first=False,
+                    mark_seen=False, dry_run=False)
+        base.update(over)
+        return _a.Namespace(**base)
+
+    def test_harvest_ingests_arbitrary_pdf_attachments(self):
+        import gmail_cnki_bridge as bridge
+        orig = bridge.imaplib.IMAP4_SSL
+        try:
+            msgs = [
+                self._msg("Fwd: 参考文献", "鲜味肽的分离鉴定研究.pdf", b"%PDF-1.4 aaa"),
+                self._msg("paper", "Umami Peptide Screening.pdf", b"%PDF-1.4 bbb"),
+            ]
+            self._patch_imap(bridge, msgs)
+            with tempfile.TemporaryDirectory() as tmp:
+                lib = Path(tmp) / "lib"
+                acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+                lib.mkdir(parents=True, exist_ok=True)
+                reports = bridge.harvest_once(
+                    bridge.GmailConfig("a@b.c", "p" * 16), acc, lib, "测试主题",
+                    self._args(bridge))
+                ingested = [r for r in reports if r["status"] == "ingested"]
+                self.assertEqual(len(ingested), 2)
+                for r in ingested:
+                    self.assertTrue(Path(r["pdf_path"]).exists())
+                # 标题应从附件名推断，而不是空
+                self.assertTrue(any("鲜味肽" in r["title"] for r in ingested))
+        finally:
+            bridge.imaplib.IMAP4_SSL = orig
+
+    def test_harvest_cnki_only_filters_english(self):
+        import gmail_cnki_bridge as bridge
+        orig = bridge.imaplib.IMAP4_SSL
+        try:
+            msgs = [
+                self._msg("a", "鲜味肽受体机制.pdf", b"%PDF-1.4 ccc"),
+                self._msg("b", "Nature Umami Review.pdf", b"%PDF-1.4 ddd"),
+            ]
+            self._patch_imap(bridge, msgs)
+            with tempfile.TemporaryDirectory() as tmp:
+                lib = Path(tmp) / "lib"
+                acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+                lib.mkdir(parents=True, exist_ok=True)
+                reports = bridge.harvest_once(
+                    bridge.GmailConfig("a@b.c", "p" * 16), acc, lib, "测试",
+                    self._args(bridge, cnki_only=True))
+                self.assertEqual(len([r for r in reports if r["status"] == "ingested"]), 1)
+                self.assertEqual(len([r for r in reports if r.get("reason") == "not_cnki"]), 1)
+        finally:
+            bridge.imaplib.IMAP4_SSL = orig
+
+    def test_harvest_dry_run_writes_nothing(self):
+        import gmail_cnki_bridge as bridge
+        orig = bridge.imaplib.IMAP4_SSL
+        try:
+            self._patch_imap(bridge, [self._msg("a", "鲜味肽.pdf", b"%PDF-1.4 eee")])
+            with tempfile.TemporaryDirectory() as tmp:
+                lib = Path(tmp) / "lib"
+                acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+                lib.mkdir(parents=True, exist_ok=True)
+                reports = bridge.harvest_once(
+                    bridge.GmailConfig("a@b.c", "p" * 16), acc, lib, "测试",
+                    self._args(bridge, dry_run=True))
+                self.assertEqual(reports[0]["status"], "would_ingest")
+                self.assertFalse((lib / "index.json").exists())
+        finally:
+            bridge.imaplib.IMAP4_SSL = orig
+
+    def test_harvest_dedups_identical_pdf(self):
+        import gmail_cnki_bridge as bridge
+        orig = bridge.imaplib.IMAP4_SSL
+        try:
+            same = b"%PDF-1.4 same-bytes"
+            self._patch_imap(bridge, [self._msg("a", "鲜味肽甲.pdf", same),
+                                      self._msg("b", "鲜味肽乙.pdf", same)])
+            with tempfile.TemporaryDirectory() as tmp:
+                lib = Path(tmp) / "lib"
+                acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+                lib.mkdir(parents=True, exist_ok=True)
+                reports = bridge.harvest_once(
+                    bridge.GmailConfig("a@b.c", "p" * 16), acc, lib, "测试",
+                    self._args(bridge))
+                self.assertEqual(len([r for r in reports if r["status"] == "ingested"]), 1)
+                self.assertEqual(len([r for r in reports if r["status"] == "duplicate"]), 1)
+        finally:
+            bridge.imaplib.IMAP4_SSL = orig
+
+    def test_harvest_limit(self):
+        import gmail_cnki_bridge as bridge
+        orig = bridge.imaplib.IMAP4_SSL
+        try:
+            self._patch_imap(bridge, [self._msg(f"s{i}", f"鲜味肽{i}.pdf", f"%PDF-{i}".encode())
+                                      for i in range(5)])
+            with tempfile.TemporaryDirectory() as tmp:
+                lib = Path(tmp) / "lib"
+                acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+                lib.mkdir(parents=True, exist_ok=True)
+                reports = bridge.harvest_once(
+                    bridge.GmailConfig("a@b.c", "p" * 16), acc, lib, "测试",
+                    self._args(bridge, limit=2))
+                self.assertEqual(len(reports), 2)
+        finally:
+            bridge.imaplib.IMAP4_SSL = orig
+
+    def test_to_imap_date(self):
+        import gmail_cnki_bridge as bridge
+        self.assertEqual(bridge.to_imap_date("2026-06-01"), "01-Jun-2026")
+        self.assertEqual(bridge.to_imap_date("01-Jun-2026"), "01-Jun-2026")
+
+    def test_build_search_criteria(self):
+        import gmail_cnki_bridge as bridge
+        import argparse as _a
+        args = _a.Namespace(unseen_only=True, since="2026-01-05", before=None,
+                            sender="prof@univ.edu", subject=None)
+        self.assertEqual(bridge.build_search_criteria(args),
+                         ["UNSEEN", "SINCE", "05-Jan-2026", "FROM", "prof@univ.edu"])
+        empty = _a.Namespace(unseen_only=False, since=None, before=None, sender=None, subject=None)
+        self.assertEqual(bridge.build_search_criteria(empty), ["ALL"])
+
+    def test_ingest_report_exposes_pdf_path_and_title(self):
+        """回归：事件钩子读的是 pdf_path/title，process_ingest_message 必须提供。"""
+        import gmail_cnki_bridge as bridge
+        entry = {"item_key": "CNKI_900", "title": "鲜味肽测试", "authors": [], "year": "2026",
+                 "journal": "", "doi": "", "abstract": "", "cnki_url": "", "source": "cnki"}
+        msg = bridge.build_ingest_message(entry, b"%PDF-1.4 zzz",
+                                          bridge.GmailConfig("a@b.c", "p"), to="a@b.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "lib"
+            acc = bridge.LiteratureAccumulator(state_file=str(lib / "s.json"), batch_size=10)
+            rep = bridge.process_ingest_message(msg, lib, acc, "测试")
+            self.assertEqual(rep["status"], "ingested")
+            self.assertEqual(rep["title"], "鲜味肽测试")
+            self.assertTrue(Path(rep["pdf_path"]).exists())
+
+
+class TestMessageParsing(unittest.TestCase):
+    """回归：原始邮件必须解析成 EmailMessage（modern policy），否则下游 iter_parts 会崩。"""
+
+    def test_parse_message_bytes_returns_modern_message(self):
+        import gmail_cnki_bridge as bridge
+        from email.message import EmailMessage
+
+        m = EmailMessage()
+        m["Subject"] = "测试主题"
+        m["Message-ID"] = "<x@y>"
+        m.set_content("正文")
+        m.add_attachment(b"%PDF-1.4 q", maintype="application", subtype="pdf", filename="a.pdf")
+
+        parsed = bridge.parse_message_bytes(m.as_bytes(policy=m.policy.clone(utf8=True)))
+        self.assertTrue(hasattr(parsed, "iter_parts"))
+        self.assertTrue(hasattr(parsed, "get_body"))
+        self.assertEqual(len(bridge.extract_pdf_parts(parsed)), 1)
+        # Message-ID 必须是可 .strip() 的字符串语义
+        self.assertIn("x@y", str(parsed.get("Message-ID")))
+
+    def test_parse_message_bytes_tolerates_garbage(self):
+        import gmail_cnki_bridge as bridge
+        parsed = bridge.parse_message_bytes(b"not-a-real-email\x00\xff")
+        self.assertIsNotNone(parsed)
