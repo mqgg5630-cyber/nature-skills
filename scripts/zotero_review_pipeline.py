@@ -361,12 +361,15 @@ class PaperCardBuilder:
             anchors = ["表 1 (质谱碎片信息表)", "会议论文集第 22 届年会"]
 
         else:
-            problem = f"针对 {item.title} 中的核心科学问题开展研究。"
-            methods = "标准实验与计算方法。"
-            quant_findings = ["具有统计学显著性改善。"]
-            mechanism = "界面协同作用。"
-            limitations = "特定实验体系限制。"
-            anchors = [f"DOI: {item.doi}"]
+            # 未知条目：绝不编造。全部标注「待核」，交由下游（Spark/人工）依据 PDF 原文补全。
+            # 历史 bug：此处曾返回「具有统计学显著性改善。」「特定实验体系限制。」等占位符，
+            # 导致综述表格里出现看似真实、实则凭空捏造的结论。
+            problem = f"待核（未从 PDF 抽取）：{item.title}"
+            methods = "待核（未从 PDF 抽取）"
+            quant_findings = ["待核（未从 PDF 抽取，请依据原文补全并标注页码）"]
+            mechanism = "待核（未从 PDF 抽取）"
+            limitations = "待核（未从 PDF 抽取）"
+            anchors = [f"DOI: {item.doi}" if item.doi else "待核（缺 DOI）"]
 
         return PaperCard(
             cite_key=item.cite_key,
@@ -389,12 +392,23 @@ class PaperCardBuilder:
 class ARTAThesisSynthesizer:
     """Synthesizes high-impact SCI Review / Chinese Thesis Chapter 1."""
 
+    # 与鲜味肽强绑定的历史范文（含 T1R1/T1R3、降盐 30%、84.5% 等写死数据）。
+    # 只有当 topic 明确属于该领域时才允许使用，否则一律走通用骨架，避免主题错位。
+    UMAMI_KEYWORDS = ("鲜味", "umami", "呈味", "T1R1", "T1R3", "增鲜", "减盐", "咸味")
+
     @classmethod
-    def generate_three_line_table_markdown(cls, cards: List[PaperCard]) -> str:
+    def _topic_matches_umami(cls, topic: str, cards: List["PaperCard"]) -> bool:
+        blob = f"{topic} " + " ".join(c.title for c in cards)
+        return any(k.lower() in blob.lower() for k in cls.UMAMI_KEYWORDS)
+
+    @classmethod
+    def generate_three_line_table_markdown(cls, cards: List[PaperCard], topic: str = "") -> str:
+        caption = f"**表 1-1 {topic} 相关研究方法、关键指标与适用边界综合对比表**" if topic \
+            else "**表 1-1 相关研究方法、关键指标与适用边界综合对比表**"
         lines = [
-            "**表 1-1 食源性鲜味肽机器学习筛选模型、受体结合机制与量化指标综合对比表**",
+            caption,
             "",
-            "| 编号 / 参考文献 | 原料基质 / 研究对象 | 核心算法与特征工程体系 | 关键定量指标与性能表现 | 受体互作机制与分子构效 | 局限性与适用边界 |",
+            "| 编号 / 参考文献 | 研究对象 | 核心方法与技术体系 | 关键定量指标 | 机制与构效解析 | 局限性与适用边界 |",
             "| :---: | :--- | :--- | :--- | :--- | :--- |",
         ]
         for c in cards:
@@ -406,8 +420,108 @@ class ARTAThesisSynthesizer:
         return "\n".join(lines)
 
     @classmethod
+    def _synthesize_generic_chapter1(cls, topic: str, student: ThesisStudentInfo,
+                                     cards: List[PaperCard]) -> str:
+        """通用（主题无关）综述骨架。
+
+        只复述本批次卡片里真实存在的信息，不注入任何领域范文与写死数值。
+        抽取不到的地方一律留「待核」，由下游 Spark / 人工依据 PDF 原文补全。
+        """
+        table_md = cls.generate_three_line_table_markdown(cards, topic)
+        n = len(cards)
+
+        refs = []
+        for idx, c in enumerate(cards, 1):
+            authors_str = "、".join(c.authors[:3]) if c.authors else "作者待核"
+            journal = c.journal or "出处待核"
+            doi_str = f" DOI: {c.doi}." if c.doi else ""
+            refs.append(f"[{idx}] {authors_str}. {c.title}[J]. {journal}, {c.year}.{doi_str} (item_key: {c.item_key})")
+
+        detail_sections = []
+        for idx, c in enumerate(cards, 1):
+            findings = "\n".join(f"   - {f}" for f in c.quantitative_findings) or "   - 待核"
+            detail_sections.append(
+                f"""### 1.3.{idx} [{c.item_key}] {c.title}
+
+- **研究问题**：{c.problem_statement}
+- **方法与技术路线**：{c.materials_methods}
+- **关键定量结果**：
+{findings}
+- **机制解释**：{c.proposed_mechanism}
+- **局限性与适用边界**：{c.limitations_and_boundary}
+- **证据锚点**：{"；".join(c.evidence_anchors) if c.evidence_anchors else "待核"}
+"""
+            )
+
+        return f"""# 第1章 绪论
+
+> ⚠️ **本文档为自动编译的综述底本（草稿），不是终稿。**
+> 内容仅由本批次 {n} 篇入库文献的结构化卡片机械汇编而成，**未经人工核验**。
+> 标注「待核」之处表示未能从 PDF 原文抽取，**严禁直接引用**。
+> 请交由审稿环节（ARTA 五支柱）完成溯源核验、因果链补全与论证重构后方可使用。
+
+## 1.1 研究背景与选题依据
+
+本章围绕《{topic}》展开文献综述。本批次共纳入 {n} 篇文献，
+均来自实际入库的 PDF 全文，文末参考文献列表与正文引用严格一一对应。
+
+> 研究背景的宏观论述需结合领域政策与产业需求撰写，**本自动底本不予臆造**，
+> 留待审稿环节依据入库文献的引言部分归纳补全。
+
+---
+
+## 1.2 本批次文献总览
+
+{table_md}
+
+---
+
+## 1.3 各文献要点（按入库顺序，逐篇溯源）
+
+{"".join(detail_sections)}
+---
+
+## 1.4 横向对比与研究空白
+
+> ⚠️ 本节需要**跨文献的问题导向论证**，不能由模板生成。
+> 自动底本仅提供上述逐篇事实，横向对比（方法演进脉络、指标可比性、
+> 矛盾结论辨析、共性瓶颈）必须由审稿环节基于 1.3 节的真实卡片重构完成。
+> 严禁写成「A 做了…、B 做了…」的流水账。
+
+待补全要点：
+1. 方法学演进主线：从本批次文献中归纳技术路线的阶段性跨越。
+2. 定量指标可比性：不同研究的评价指标是否同口径，能否横向比较。
+3. 共性局限与研究空白：由各文献 limitations 归纳，导出本课题的切入点。
+
+---
+
+## 1.5 本文研究内容
+
+针对上述研究空白，本学位论文围绕《{topic}》展开系统研究。
+
+> 章节规划需与导师确认后填写，本自动底本不预设章节标题，避免与实际研究内容错位。
+
+---
+
+## 参考文献
+
+{chr(10).join(refs)}
+
+---
+
+*本底本由 Nature-Skills ARTA 引擎自动编译；作者：{student.student_name}；
+单位：{student.school_name}；专业：{student.degree_field}。*
+"""
+
+    @classmethod
     def synthesize_thesis_chapter1(cls, topic: str, student: ThesisStudentInfo, cards: List[PaperCard]) -> str:
-        table_md = cls.generate_three_line_table_markdown(cards)
+        # 主题不匹配鲜味肽领域时，走通用骨架。
+        # 历史 bug：此处无条件套用鲜味肽范文，导致「深度学习筛选抗菌肽」批次
+        # 生成的绪论里出现 T1R1/T1R3 受体、降盐 30%、84.5% 等完全错位的内容。
+        if not cls._topic_matches_umami(topic, cards):
+            return cls._synthesize_generic_chapter1(topic, student, cards)
+
+        table_md = cls.generate_three_line_table_markdown(cards, topic)
 
         doc = f"""# 第1章 绪论
 
