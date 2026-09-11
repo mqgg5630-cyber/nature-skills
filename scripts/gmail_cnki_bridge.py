@@ -5,6 +5,8 @@ Gmail ↔ CNKI Literature Bridge (Nature-Skills Edition)
 把「只推知网文献到 Gmail → 下载知网 PDF 回传 Gmail → 攒够阈值自动生成综述」
 的完整闭环封装为一个脚本，四个子命令：
 
+  topic      一条龙：给个主题 → 检索下载知网 PDF → 入库去重 → 综述 → 寄给 Spark
+  flush      把「不满一批」的余量强制出综述并寄给 Spark（邮件零散到达时收口用）
   deliver    把综述成果 / 单篇 PDF 通过 Gmail 寄给【云端 Spark】（Spark 只能收邮件时用）
   harvest    扫描邮箱里【已有】的 PDF 附件（任意邮件，非本系统发出的也行）→
              落盘文献库 → 去重 → 累积 → 触发综述/Spark（历史文献一次性回收）
@@ -1113,6 +1115,207 @@ def auto_deliver_if_configured(args: argparse.Namespace, cfg: GmailConfig,
         print(f"   ⚠️  自动寄送 Spark 失败（成果仍在本地 {batch_dir}）: {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# flush：把「不满一批」的余量强制出综述（解决邮件零散到达、永远攒不满的问题）
+# ---------------------------------------------------------------------------
+
+def flush_queue(accumulator: LiteratureAccumulator, library_dir: Path, topic: str,
+                min_papers: int = 1) -> Optional[Dict[str, Any]]:
+    """把累积队列里剩下的论文立即编译成综述，不等攒满 batch_size。
+
+    背景：邮件是一封一封来的，如果只按「满 N 篇」触发，队列里剩 7 篇会永远卡住，
+    Spark 那边就一直收不到东西。flush 提供「手动/定时收口」的能力。
+    """
+    pending = list(accumulator.queue)
+    if len(pending) < max(1, min_papers):
+        print(f"   队列只有 {len(pending)} 篇，未达 --min-papers {min_papers}，不强制出综述。")
+        return None
+    print(f"   ⚡ 强制收口：把队列里的 {len(pending)} 篇立即编译成综述")
+    result = accumulator._execute_batch_synthesis(
+        pending, topic=topic, output_dir=str(library_dir / "reviews"))
+    # 与 add_paper 达阈值时保持一致的状态推进
+    accumulator.queue = accumulator.queue[len(pending):]
+    accumulator.processed_batches += 1
+    accumulator.save_state()
+    return result
+
+
+def queue_age_seconds(library_dir: Path) -> Optional[float]:
+    """队列里最早那篇等了多久（秒）。用于 --flush-after 定时收口。"""
+    state = _load_json_file(library_dir / "accumulator_state.json", {})
+    queue = state.get("queue") or []
+    if not queue:
+        return None
+    stamps = []
+    for item in queue:
+        raw = item.get("received_at") if isinstance(item, dict) else None
+        if not raw:
+            continue
+        try:
+            stamps.append(time.mktime(time.strptime(str(raw), "%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            continue
+    if not stamps:
+        return None
+    return time.time() - min(stamps)
+
+
+def maybe_flush_by_age(args: argparse.Namespace, cfg: GmailConfig,
+                       accumulator: LiteratureAccumulator, library_dir: Path) -> None:
+    """watch 守护模式下：队列等待超过 --flush-after 秒就自动收口出综述。"""
+    after = getattr(args, "flush_after", 0) or 0
+    if after <= 0 or not accumulator.queue:
+        return
+    age = queue_age_seconds(library_dir)
+    if age is None or age < after:
+        return
+    print(f"   ⏰ 队列已等待 {age / 60:.1f} 分钟（阈值 {after / 60:.1f} 分钟），自动收口")
+    res = flush_queue(accumulator, library_dir, args.topic,
+                      min_papers=getattr(args, "min_papers", 1))
+    if res:
+        auto_deliver_if_configured(args, cfg, res)
+
+
+
+# ---------------------------------------------------------------------------
+# topic：一条命令走完「给个主题 → 下载 → 入库 → 综述 → 寄 Spark」
+# ---------------------------------------------------------------------------
+
+def download_topic_pdfs(topic: str, count: int, work_dir: Path, node: str = "node",
+                        skill_dir: Optional[Path] = None, timeout: int = 1800
+                        ) -> Tuple[List[Path], List[Dict[str, Any]]]:
+    """用 nature-downloader 按主题检索并下载 PDF，返回 (PDF 路径列表, 原始结果)。
+
+    走 batch_download.mjs 的 --topic 路由；需要你本机已登录机构账号的 Chrome。
+    """
+    skill_dir = skill_dir or default_skill_dir()
+    script = skill_dir / "scripts" / "batch_download.mjs"
+    if not script.exists():
+        raise SystemExit(f"未找到 nature-downloader 脚本: {script}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [node, str(script), "--topic", topic, "--count", str(count),
+           "--no-si", "--out", str(work_dir)]
+    print(f"   ▶️  {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("下载器超时（检查 Chrome 是否已登录机构账号）")
+    except FileNotFoundError:
+        raise SystemExit(f"未找到 node 可执行文件: {node}")
+    try:
+        data = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        tail = (proc.stderr or proc.stdout)[-500:]
+        raise SystemExit(f"无法解析下载器输出。stderr 尾部:\n{tail}")
+
+    pdfs: List[Path] = []
+    results = data.get("results", [])
+    for r in results:
+        status = r.get("status", "")
+        f = r.get("file")
+        if status in SUCCESS_DOWNLOAD_STATUSES and f and Path(f).exists():
+            pdfs.append(Path(f))
+        else:
+            print(f"   ⏭️  未取得全文: {str(r.get('title', ''))[:40]} ({status})"
+                  + (f" → {r.get('next_action')}" if r.get("next_action") else ""))
+    return pdfs, results
+
+
+def cmd_topic(args: argparse.Namespace, cfg: GmailConfig) -> None:
+    """一条龙：主题 → 下载 PDF → 入库去重 → 综述 → 寄给云端 Spark。"""
+    library_dir = Path(args.library)
+    work_dir = Path(args.work_dir)
+    accumulator = LiteratureAccumulator(
+        state_file=str(library_dir / "accumulator_state.json"), batch_size=args.batch_size)
+
+    print("=" * 72)
+    print(f"🎯 [topic] 主题一条龙: 《{args.topic}》 目标 {args.count} 篇")
+    print(f"   文献库: {library_dir.resolve()} | 批次阈值: {args.batch_size}")
+    print("=" * 72)
+
+    if args.local_pdf_dir:
+        local_dir = Path(args.local_pdf_dir).expanduser()
+        pdfs = sorted(p for p in local_dir.iterdir()
+                      if p.is_file() and p.suffix.lower() == ".pdf") if local_dir.exists() else []
+        print(f"📂 使用本地目录已有 PDF: {local_dir}（{len(pdfs)} 个）")
+    else:
+        print("🔍 调用 nature-downloader 按主题检索下载（需已登录机构 Chrome）…")
+        pdfs, _ = download_topic_pdfs(args.topic, args.count, work_dir,
+                                      node=args.node,
+                                      skill_dir=Path(args.skill_dir) if args.skill_dir else None)
+        print(f"   ✅ 取得 {len(pdfs)} 篇全文 PDF")
+
+    if not pdfs:
+        print("⚠️  没有可用 PDF。若是机构登录/验证拦截，请在 Chrome 里手动完成一次，"
+              "或手动下载后用 --local-pdf-dir 指向该目录。")
+        return
+
+    ingested = 0
+    for pdf in pdfs:
+        data = pdf.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        index = _load_json_file(library_dir / "index.json", {})
+        if sha256 in index:
+            print(f"   ⏭️  已存在（去重）: {pdf.name}")
+            continue
+        entry = normalize_entries([{"title": pdf.stem, "source": "cnki"}])[0]
+        paper_dir = library_dir / entry["item_key"]
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        saved = paper_dir / f"{entry['item_key']}.pdf"
+        saved.write_bytes(data)
+        index[sha256] = {"item_key": entry["item_key"], "title": entry["title"],
+                         "saved_path": str(saved),
+                         "received_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        _save_json_file(library_dir / "index.json", index)
+
+        queued = QueuedPaper(
+            item_key=entry["item_key"], title=entry["title"], authors=entry["authors"],
+            year=entry["year"], journal=entry["journal"], doi=entry["doi"],
+            abstract=entry["abstract"], received_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            pdf_path=str(saved), source="CNKI-Topic")
+        res = accumulator.add_paper(queued, topic=args.topic,
+                                    output_dir=str(library_dir / "reviews"))
+        ingested += 1
+        if res:
+            print(f"   🎉 批次 #{res['batch_id']} 综述完成: {res['chapter1_path']}")
+            auto_deliver_if_configured(args, cfg, res)
+
+    print("-" * 72)
+    print(f"📊 本轮入库 {ingested} 篇，当前队列 {len(accumulator.queue)}/{args.batch_size}")
+
+    # 主题模式默认收口：一次跑完就出综述，不让文献烂在队列里
+    if accumulator.queue and not args.no_flush:
+        res = flush_queue(accumulator, library_dir, args.topic, min_papers=args.min_papers)
+        if res:
+            print(f"   🎉 综述完成: {res['chapter1_path']}")
+            auto_deliver_if_configured(args, cfg, res)
+    print("=" * 72)
+
+
+def cmd_flush(args: argparse.Namespace, cfg: GmailConfig) -> None:
+    library_dir = Path(args.library)
+    accumulator = LiteratureAccumulator(
+        state_file=str(library_dir / "accumulator_state.json"), batch_size=args.batch_size)
+    print("=" * 72)
+    print(f"⚡ [flush] 强制收口未满批次（当前队列 {len(accumulator.queue)} 篇）")
+    print("=" * 72)
+    res = flush_queue(accumulator, library_dir, args.topic, min_papers=args.min_papers)
+    if not res:
+        print("=" * 72)
+        return
+    print(f"   🎉 综述完成: {res['chapter1_path']}")
+    to = args.deliver_to or os.environ.get("SPARK_EMAIL", "")
+    if to and not args.no_deliver:
+        cfg.require()
+        deliver_review(cfg, args.topic, Path(res["chapter1_path"]).parent, to,
+                       cloud_links=list(args.cloud_link or []), dry_run=False, inline=True)
+    elif not to:
+        print("   （未配置 --deliver-to / SPARK_EMAIL，未寄给 Spark）")
+    print("=" * 72)
+
+
 def cmd_deliver(args: argparse.Namespace, cfg: GmailConfig) -> None:
     """把已生成的综述 / 单篇 PDF 通过 Gmail 寄给云端 Spark。"""
     if not args.dry_run:
@@ -1300,6 +1503,7 @@ def cmd_watch(args: argparse.Namespace, cfg: GmailConfig) -> None:
                     time.sleep(args.interval)
                 try:
                     run_once()
+                    maybe_flush_by_age(args, cfg, accumulator, library_dir)
                 except Exception as exc:  # 守护模式下网络抖动不应终止
                     print(f"   ⚠️  处理异常（稍后重试）: {exc}")
                     time.sleep(min(args.interval, 60))
@@ -1531,6 +1735,10 @@ def main() -> None:
                          help="综述生成后自动寄给该邮箱（云端 Spark），或 env SPARK_EMAIL")
     p_watch.add_argument("--cloud-link", action="append", default=[],
                          help="随成果邮件附上的云盘链接（可重复传）")
+    p_watch.add_argument("--flush-after", type=int, default=0,
+                         help="队列最早一篇等待超过 N 秒就自动收口出综述（0=关闭，建议 86400=一天）")
+    p_watch.add_argument("--min-papers", type=int, default=1,
+                         help="配合 --flush-after：少于这个篇数不强制出综述")
 
     p_harv = sub.add_parser("harvest", help="扫描邮箱里【已有】的 PDF 附件并入库（一次性历史回收）")
     p_harv.add_argument("--folder", type=str, default="INBOX", help="IMAP 文件夹，如 INBOX / \"[Gmail]/All Mail\" / 自建标签")
@@ -1567,6 +1775,30 @@ def main() -> None:
     p_del.add_argument("--no-inline", action="store_true", help="正文不内联综述全文，只发附件")
     p_del.add_argument("--dry-run", action="store_true", help="不发送，保存 .eml")
 
+    p_topic = sub.add_parser("topic", help="一条龙：给个主题 → 下载 → 入库 → 综述 → 寄给 Spark")
+    p_topic.add_argument("--topic", required=True, help="检索主题，如「食源性鲜味肽机器学习筛选」")
+    p_topic.add_argument("--count", type=int, default=10, help="目标下载篇数")
+    p_topic.add_argument("--library", type=str, default="outputs/gmail_library")
+    p_topic.add_argument("--work-dir", type=str, default="outputs/cnki_topic")
+    p_topic.add_argument("--batch-size", type=int, default=10)
+    p_topic.add_argument("--min-papers", type=int, default=1, help="收口时的最少篇数")
+    p_topic.add_argument("--no-flush", action="store_true", help="不强制收口，攒够 batch-size 再出")
+    p_topic.add_argument("--local-pdf-dir", type=str, default=None,
+                         help="跳过下载器，直接用该目录下已有的 PDF")
+    p_topic.add_argument("--node", type=str, default="node")
+    p_topic.add_argument("--skill-dir", type=str, default=None)
+    p_topic.add_argument("--deliver-to", type=str, default=None, help="或 env SPARK_EMAIL")
+    p_topic.add_argument("--cloud-link", action="append", default=[])
+
+    p_flush = sub.add_parser("flush", help="把不满一批的余量强制编译成综述并寄给 Spark")
+    p_flush.add_argument("--library", type=str, default="outputs/gmail_library")
+    p_flush.add_argument("--topic", type=str, default="知网文献自动综述")
+    p_flush.add_argument("--batch-size", type=int, default=10)
+    p_flush.add_argument("--min-papers", type=int, default=1, help="少于这个篇数就不出综述")
+    p_flush.add_argument("--deliver-to", type=str, default=None, help="或 env SPARK_EMAIL")
+    p_flush.add_argument("--cloud-link", action="append", default=[])
+    p_flush.add_argument("--no-deliver", action="store_true", help="只编译，不寄邮件")
+
     p_doctor = sub.add_parser("doctor", help="环境体检（Python/凭据/Node/下载器/可选依赖）")
     p_doctor.add_argument("--node", type=str, default="node")
     p_doctor.add_argument("--skill-dir", type=str, default=None)
@@ -1583,6 +1815,10 @@ def main() -> None:
         cmd_ingest(args, cfg)
     elif args.mode == "watch":
         cmd_watch(args, cfg)
+    elif args.mode == "topic":
+        cmd_topic(args, cfg)
+    elif args.mode == "flush":
+        cmd_flush(args, cfg)
     elif args.mode == "deliver":
         cmd_deliver(args, cfg)
     elif args.mode == "harvest":

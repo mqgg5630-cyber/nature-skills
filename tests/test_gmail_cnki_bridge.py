@@ -3,6 +3,8 @@
 
 import hashlib
 import json
+import os
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -593,3 +595,115 @@ class TestDeliverToCloudSpark(unittest.TestCase):
                     {"chapter1_path": str(b / "thesis_chapter1_review.md")})
         finally:
             bridge.send_message = orig
+
+
+class TestFlushAndTopic(unittest.TestCase):
+    """flush（未满批收口）与 topic（主题一条龙）。"""
+
+    def _acc(self, tmp, n, batch_size=10):
+        import gmail_cnki_bridge as bridge
+        lib = Path(tmp) / "lib"
+        lib.mkdir(parents=True, exist_ok=True)
+        acc = bridge.LiteratureAccumulator(state_file=str(lib / "accumulator_state.json"),
+                                           batch_size=batch_size)
+        for i in range(n):
+            acc.add_paper(bridge.QueuedPaper(f"K{i}", f"标题{i}", ["作者"], "2024", "食品科学",
+                                             f"10.1/{i}", "摘要", "2026-01-01 00:00:00"),
+                          topic="测试", output_dir=str(lib / "reviews"))
+        return bridge, lib, acc
+
+    def test_flush_compiles_partial_batch(self):
+        """核心回归：7 篇不满 10 篇时，flush 必须能出综述，否则永远卡队列。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, lib, acc = self._acc(tmp, 7)
+            self.assertEqual(len(acc.queue), 7)
+            res = bridge.flush_queue(acc, lib, "测试", min_papers=1)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["paper_count"], 7)
+            self.assertTrue(Path(res["chapter1_path"]).exists())
+            self.assertEqual(len(acc.queue), 0)
+            self.assertEqual(acc.processed_batches, 1)
+
+    def test_flush_respects_min_papers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, lib, acc = self._acc(tmp, 2)
+            self.assertIsNone(bridge.flush_queue(acc, lib, "测试", min_papers=5))
+            self.assertEqual(len(acc.queue), 2)  # 队列未被清空
+
+    def test_flush_on_empty_queue_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, lib, acc = self._acc(tmp, 0)
+            self.assertIsNone(bridge.flush_queue(acc, lib, "测试", min_papers=1))
+
+    def test_flush_state_persists_across_reload(self):
+        """收口后重新加载状态，队列必须真的空了（防止重复出综述）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, lib, acc = self._acc(tmp, 3)
+            bridge.flush_queue(acc, lib, "测试", min_papers=1)
+            reloaded = bridge.LiteratureAccumulator(
+                state_file=str(lib / "accumulator_state.json"), batch_size=10)
+            self.assertEqual(len(reloaded.queue), 0)
+            self.assertEqual(reloaded.processed_batches, 1)
+
+    def test_queue_age_seconds(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "lib"
+            lib.mkdir(parents=True)
+            self.assertIsNone(bridge.queue_age_seconds(lib))  # 空队列
+            old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 7200))
+            (lib / "accumulator_state.json").write_text(
+                json.dumps({"queue": [{"received_at": old}], "processed_batches": 0}),
+                encoding="utf-8")
+            age = bridge.queue_age_seconds(lib)
+            self.assertGreater(age, 7000)
+
+    def test_topic_ingests_local_pdfs_and_flushes(self):
+        """topic --local-pdf-dir：不碰网络，验证入库+去重+自动收口出综述。"""
+        import gmail_cnki_bridge as bridge
+        import argparse as _a
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pdfs"
+            src.mkdir()
+            for i in range(3):
+                (src / f"鲜味肽研究{i}.pdf").write_bytes(f"%PDF-1.4 body{i}".encode())
+            lib = Path(tmp) / "lib"
+            args = _a.Namespace(
+                topic="鲜味肽", count=3, library=str(lib), work_dir=str(Path(tmp) / "w"),
+                batch_size=10, min_papers=1, no_flush=False, local_pdf_dir=str(src),
+                node="node", skill_dir=None, deliver_to=None, cloud_link=[])
+            saved = os.environ.pop("SPARK_EMAIL", None)
+            try:
+                bridge.cmd_topic(args, bridge.GmailConfig("a@b.c", "p" * 16))
+            finally:
+                if saved is not None:
+                    os.environ["SPARK_EMAIL"] = saved
+            batch = bridge.find_latest_batch(lib)
+            self.assertIsNotNone(batch)
+            self.assertTrue((batch / "thesis_chapter1_review.md").exists())
+            index = json.loads((lib / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(index), 3)
+
+    def test_topic_dedups_on_rerun(self):
+        import gmail_cnki_bridge as bridge
+        import argparse as _a
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pdfs"
+            src.mkdir()
+            (src / "鲜味肽.pdf").write_bytes(b"%PDF-1.4 same")
+            lib = Path(tmp) / "lib"
+            def mk():
+                return _a.Namespace(topic="鲜味肽", count=1, library=str(lib),
+                                    work_dir=str(Path(tmp) / "w"), batch_size=10, min_papers=1,
+                                    no_flush=False, local_pdf_dir=str(src), node="node",
+                                    skill_dir=None, deliver_to=None, cloud_link=[])
+            saved = os.environ.pop("SPARK_EMAIL", None)
+            try:
+                cfg = bridge.GmailConfig("a@b.c", "p" * 16)
+                bridge.cmd_topic(mk(), cfg)
+                bridge.cmd_topic(mk(), cfg)   # 第二次应全部去重
+            finally:
+                if saved is not None:
+                    os.environ["SPARK_EMAIL"] = saved
+            index = json.loads((lib / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(index), 1)

@@ -417,3 +417,72 @@ python scripts/gmail_cnki_bridge.py deliver --pdf outputs/gmail_library/CNKI_001
 **三条边界**：① 本机必须开着（下载/编译/发信都在本地，Spark 没有你的机构登录态，
 替不了你连知网）；② `--cloud-link` 只写链接进正文，**不会替你上传文件**；
 ③ Spark 的回信不会自动回流入库，你自己看邮件。
+
+## 十五、触发策略：一封一封来的邮件，到底什么时候出综述？
+
+这是最容易踩坑的地方。累积器**只在攒满 `--batch-size` 时**才编译综述——
+如果你设 10 篇，队列里躺着 7 篇，那就**永远不会**出综述，Spark 那边一直收不到东西。
+现在提供三种触发策略，按需选：
+
+| 策略 | 命令 | 适合 |
+|---|---|---|
+| **满 N 篇触发**（默认） | `--batch-size 10` | 文献稳定持续进来 |
+| **一篇一触发** | `--batch-size 1` | 想让 Spark 逐篇精读，每来一篇立刻寄一份 |
+| **定时收口** | `--batch-size 10 --flush-after 86400` | 攒够就出；攒不够也不让它烂在队列里 |
+| **手动收口** | `flush` 子命令 | 随时把余量清出来 |
+
+### 一篇一触发
+
+```powershell
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle --batch-size 1 `
+    --topic "食源性鲜味肽" --deliver-to "spark@xxx"
+```
+
+每进一篇 PDF 立刻编译一份"综述"（其实是单篇精读）并寄给 Spark。
+**注意**：Spark 那边会收到很多封邮件，且单篇内容做不出真正的横向综述。
+建议单篇场景改用 `deliver --pdf`（发 `[CNKI-CARD]`，让 Spark 抽 PaperCard），
+综述留给多篇批次。
+
+### 定时收口（推荐）
+
+```powershell
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
+    --batch-size 10 --flush-after 86400 --min-papers 3 `
+    --topic "食源性鲜味肽" --deliver-to "spark@xxx"
+```
+
+含义：攒满 10 篇立刻出；若队列里最早那篇已经等了超过 24 小时，
+且至少有 3 篇，就强制收口出综述。**兼顾质量和时效，不会卡死。**
+
+### 手动收口
+
+```powershell
+# 看看队列里现在有几篇（读 accumulator_state.json）
+python scripts/gmail_cnki_bridge.py flush --topic "食源性鲜味肽" --min-papers 5 --deliver-to "spark@xxx"
+
+# 只编译不寄
+python scripts/gmail_cnki_bridge.py flush --topic "…" --no-deliver
+```
+
+## 十六、说一个主题，自动下载 → 综述 → 寄给 Spark（topic）
+
+```powershell
+$env:SPARK_EMAIL="spark@xxx"
+
+python scripts/gmail_cnki_bridge.py topic --topic "食源性鲜味肽机器学习筛选" --count 10
+```
+
+一条命令走完：**检索下载知网 PDF → 入库去重 → 编译综述 → 自动寄给 Spark**。
+跑完默认自动收口（不会因为只下到 7 篇就卡住），加 `--no-flush` 可关闭。
+
+下不下来时（机构验证拦截等），先在 Chrome 里手动完成一次登录，或者手动把 PDF
+存到某个目录，然后：
+
+```powershell
+python scripts/gmail_cnki_bridge.py topic --topic "食源性鲜味肽" --local-pdf-dir "E:\下载"
+```
+
+> ⚠️ 主题检索走 nature-downloader 的 `--topic` 路由，**需要你本机 Chrome 已登录机构账号**。
+> 命中率取决于知网检索结果和机构权限，控制台会逐条打印未取得全文的原因
+> （如 `carsi_waiting_user` = 需要你手动登录一次）。真实命中几篇以运行结果为准，
+> 不要假设 `--count 10` 就一定能下满 10 篇。
