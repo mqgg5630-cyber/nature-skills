@@ -163,6 +163,9 @@ outputs/
 
 ## 七、与 Spark / Antigravity 的协作方式
 
+> 📋 **完整的 Spark 指令集（提示词 + 钩子命令 + 任务单轮询）见
+> [`docs/spark-prompts.md`](spark-prompts.md)，复制即用。** 下面是最短的一段。
+
 把下面这段话直接交给你的编排 agent（Spark），它就能跑通整条链：
 
 ```text
@@ -282,6 +285,11 @@ python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
 ```
 
 `--only review_ready` 表示只在综述就绪时才叫 Spark，单篇入库只记账不打扰。
+
+> ⚠️ 上面的 `spark run review ...` 只是**占位示例**，请换成你的 Spark 真实命令。
+> 如果你的 Spark 没有 CLI（只有对话界面），就不要传 `--spark-cmd`：
+> 钩子仍会把事件写进 `outputs/spark_events/tasks/`，让 Spark 扫目录取任务。
+> 三种接法的完整指令见 [`docs/spark-prompts.md`](spark-prompts.md)。
 
 ### 完整的一条龙命令（推荐）
 
