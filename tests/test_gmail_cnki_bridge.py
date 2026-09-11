@@ -491,3 +491,105 @@ class TestMessageParsing(unittest.TestCase):
         import gmail_cnki_bridge as bridge
         parsed = bridge.parse_message_bytes(b"not-a-real-email\x00\xff")
         self.assertIsNotNone(parsed)
+
+
+class TestDeliverToCloudSpark(unittest.TestCase):
+    """deliver：把成果寄给只能收 Gmail 的云端 Spark。"""
+
+    def _batch(self, root: Path, big=False):
+        b = root / "reviews" / "batch_1"
+        b.mkdir(parents=True, exist_ok=True)
+        (b / "thesis_chapter1_review.md").write_text("# 综述\n\nIC50 = 3.2 μM（第5页）。", encoding="utf-8")
+        payload = b"x" * (20 * 1024 * 1024) if big else b'{"a":1}'
+        (b / "arta_synthesis_payload.json").write_bytes(payload)
+        (b / "arta_ppt_payload.json").write_text('{"b":2}', encoding="utf-8")
+        return b
+
+    def test_review_email_inlines_fulltext_and_instructions(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._batch(Path(tmp))
+            msg, notes = bridge.build_review_delivery_message(
+                bridge.GmailConfig("me@gmail.com", "p" * 16), "鲜味肽", b, "spark@cloud.ai",
+                cloud_links=["https://drive.google.com/x"])
+            body = msg.get_body("plain").get_content()
+            self.assertIn("【你的任务】", body)          # 任务说明
+            self.assertIn("IC50 = 3.2", body)            # 综述全文内联
+            self.assertIn("https://drive.google.com/x", body)  # 云盘链接
+            self.assertIn("严禁编造", body)               # 防幻觉红线
+            self.assertTrue(msg["Subject"].startswith(bridge.DELIVER_PREFIX))
+            self.assertEqual(msg["To"], "spark@cloud.ai")
+            names = [p.get_filename() for p in msg.iter_attachments()]
+            self.assertIn("thesis_chapter1_review.md", names)
+            self.assertEqual(notes, [])
+
+    def test_oversized_attachment_is_skipped_with_note(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._batch(Path(tmp), big=True)
+            msg, notes = bridge.build_review_delivery_message(
+                bridge.GmailConfig("me@gmail.com", "p" * 16), "鲜味肽", b, "spark@cloud.ai")
+            self.assertTrue(any("超限" in n for n in notes))
+            names = [p.get_filename() for p in msg.iter_attachments()]
+            self.assertNotIn("arta_synthesis_payload.json", names)
+            self.assertIn("thesis_chapter1_review.md", names)
+
+    def test_card_email_carries_pdf_and_extraction_task(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "p.pdf"
+            pdf.write_bytes(b"%PDF-1.4 body")
+            entry = bridge.normalize_entries([{"item_key": "CNKI_1", "title": "鲜味肽研究"}])[0]
+            msg, notes = bridge.build_card_delivery_message(
+                bridge.GmailConfig("me@gmail.com", "p"), "鲜味肽", entry, pdf, "spark@cloud.ai")
+            body = msg.get_body("plain").get_content()
+            self.assertIn("PaperCard", body)
+            self.assertIn("标注所在页码", body)
+            self.assertTrue(msg["Subject"].startswith(bridge.CARD_PREFIX))
+            self.assertEqual([p.get_filename() for p in msg.iter_attachments()], ["CNKI_1.pdf"])
+            self.assertEqual(notes, [])
+
+    def test_find_latest_batch_sorts_numerically(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for n in (1, 2, 10):
+                (root / "reviews" / f"batch_{n}").mkdir(parents=True)
+            self.assertEqual(bridge.find_latest_batch(root).name, "batch_10")
+
+    def test_find_latest_batch_none_when_empty(self):
+        import gmail_cnki_bridge as bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(bridge.find_latest_batch(Path(tmp)))
+
+    def test_auto_deliver_noop_without_target(self):
+        """没配 --deliver-to / SPARK_EMAIL 时必须安静跳过，不能抛错。"""
+        import gmail_cnki_bridge as bridge
+        import argparse as _a
+        import os as _os
+        saved = _os.environ.pop("SPARK_EMAIL", None)
+        try:
+            args = _a.Namespace(deliver_to=None, topic="t", cloud_link=[])
+            bridge.auto_deliver_if_configured(args, bridge.GmailConfig("a@b.c", "p"),
+                                              {"chapter1_path": "/nonexistent/batch_1/x.md"})
+        finally:
+            if saved is not None:
+                _os.environ["SPARK_EMAIL"] = saved
+
+    def test_auto_deliver_swallows_send_failure(self):
+        """寄送失败不能中断监听循环，成果仍在本地。"""
+        import gmail_cnki_bridge as bridge
+        import argparse as _a
+        orig = bridge.send_message
+        try:
+            def boom(cfg, msg):
+                raise RuntimeError("smtp down")
+            bridge.send_message = boom
+            with tempfile.TemporaryDirectory() as tmp:
+                b = self._batch(Path(tmp))
+                args = _a.Namespace(deliver_to="spark@cloud.ai", topic="t", cloud_link=[])
+                bridge.auto_deliver_if_configured(
+                    args, bridge.GmailConfig("a@b.c", "p" * 16),
+                    {"chapter1_path": str(b / "thesis_chapter1_review.md")})
+        finally:
+            bridge.send_message = orig

@@ -373,3 +373,47 @@ python scripts/gmail_cnki_bridge.py harvest --cnki-only --mark-seen --batch-size
 python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle --batch-size 10 --topic "…" `
     --on-event "python scripts/spark_event_hook.py"
 ```
+
+## 十四、云端 Spark：把成果寄回给它（deliver）
+
+如果你的 Spark 在云端、**只能收 Gmail 邮件 + 读云盘**，那么本地钩子（`--on-event`）、
+CLI（`--spark-cmd`）、webhook 都用不上——必须把成果**寄过去**。用 `deliver`：
+
+```powershell
+$env:SPARK_EMAIL="spark那边的收件地址@xxx"
+
+# 收存量 → 编译 → 自动寄给 Spark，一条命令走完
+python scripts/gmail_cnki_bridge.py harvest --batch-size 10 --cnki-only --mark-seen `
+    --topic "食源性鲜味肽高通量筛选与呈味机制解析" `
+    --cloud-link "https://drive.google.com/drive/folders/你的文件夹ID"
+
+# 挂实时监听，以后新邮件自动走完全程
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle --batch-size 10 `
+    --topic "…" --deliver-to "spark@xxx" --cloud-link "https://drive.google.com/..."
+
+# 手动补寄（先 dry-run 看内容）
+python scripts/gmail_cnki_bridge.py deliver --topic "…" --dry-run
+python scripts/gmail_cnki_bridge.py deliver --topic "…" --to "spark@xxx"
+
+# 寄单篇 PDF 让 Spark 抽 PaperCard
+python scripts/gmail_cnki_bridge.py deliver --pdf outputs/gmail_library/CNKI_001/CNKI_001.pdf `
+    --item-key CNKI_001 --title "…" --to "spark@xxx"
+```
+
+成果邮件（主题前缀 `[CNKI-REVIEW]`）长这样：
+
+- **正文** = 任务说明（ARTA 五支柱审计要求 + 防幻觉红线）+ **综述全文内联**
+  + 云盘链接。内联是刻意的：云端 agent 解析附件常不稳，正文最保险。
+- **附件** = `thesis_chapter1_review.md` / `arta_synthesis_payload.json` / `arta_ppt_payload.json`
+- 单篇模式前缀 `[CNKI-CARD]`，附 PDF，任务是抽取 PaperCard。
+
+**大文件**：Gmail 单封上限 25MB，脚本按 16MB 卡（base64 膨胀 ~1.37x）。超限附件会
+自动跳过并提示，整封信照发；把文件传云盘后用 `--cloud-link`（可重复传）带进正文。
+
+**Spark 侧配置**：建两个 Gmail 过滤器（主题含 `[CNKI-REVIEW]` / `[CNKI-CARD]`），
+并把常驻审稿指令设给 Spark——完整可复制的提示词见
+[`docs/spark-prompts.md`](spark-prompts.md) §0.6。
+
+**三条边界**：① 本机必须开着（下载/编译/发信都在本地，Spark 没有你的机构登录态，
+替不了你连知网）；② `--cloud-link` 只写链接进正文，**不会替你上传文件**；
+③ Spark 的回信不会自动回流入库，你自己看邮件。

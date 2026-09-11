@@ -1,15 +1,129 @@
 # Spark 指令集（复制即用）
 
-面向 `scripts/gmail_cnki_bridge.py` 全流程的 Spark / Antigravity 编排指令。
-分两类：**A. 贴给 Spark 的自然语言提示词**（Spark 是对话式 agent 时用）、
-**B. 挂在钩子上的机器指令**（Spark 是可执行 CLI / HTTP 服务时用）。
-
-> ⚠️ 本文中 `spark run ...` 一律是**占位示例**。请替换成你的 Spark 实际提供的命令；
-> 如果你的 Spark 只有对话界面、没有 CLI，请用 A 类提示词 + 下面的「任务单轮询」模式。
+> ## 🔑 先确定你的 Spark 是哪种形态
+>
+> | 形态 | 怎么接 | 看哪节 |
+> |---|---|---|
+> | **云端，只能收 Gmail + 读云盘** ← 你是这种 | 本机把成果**寄给** Spark；Spark 在邮件里干活 | **[§0 云端 Spark](#0-云端-spark只能收-gmail读云盘)** |
+> | 本地对话式 agent | 贴提示词，它自己执行命令 | §A |
+> | 本地 CLI / HTTP 服务 | `--spark-cmd` / `--webhook` | §B |
+>
+> 本机（Windows + 已登录 CNKI 的 Chrome）负责**下载和编译**，
+> 云端 Spark 负责**审稿和改写**——它碰不到你的本地文件，所以一切都得通过邮件送过去。
 
 ---
 
-## A. 贴给 Spark 的提示词
+## 0. 云端 Spark（只能收 Gmail、读云盘）
+
+### 0.1 数据怎么流
+
+```
+本机 harvest/watch          → 收邮箱已有 PDF、编译综述（全在本地）
+      ↓ deliver（SMTP 发信）
+Spark 的 Gmail 收件箱        → 收到 [CNKI-REVIEW] 邮件：
+                                正文 = 任务说明 + 综述全文（内联，不依赖附件解析）
+                                附件 = .md / payload.json / ppt.json
+                                正文还可带云盘链接（大文件走这里）
+      ↓ Spark 回信
+你的 Gmail                   → Spark 把审计结果/修订稿回邮件给你
+```
+
+关键点：**综述全文直接内联在正文里**。很多云端 agent 解析附件不稳，正文最保险；
+附件同时附上，方便你自己存档。
+
+### 0.2 一条命令：收邮箱存量 + 编译 + 自动寄给 Spark
+
+```powershell
+$env:PYTHONUTF8=1
+$env:GMAIL_EMAIL="jzthjyz@gmail.com"
+$env:GMAIL_APP_PASSWORD="你的16位应用专用密码"
+$env:SPARK_EMAIL="spark那边的收件地址@xxx"     # 设了它就不用每次传 --deliver-to
+
+python scripts/gmail_cnki_bridge.py harvest --batch-size 10 --cnki-only --mark-seen `
+    --topic "食源性鲜味肽高通量筛选与呈味机制解析" `
+    --cloud-link "https://drive.google.com/drive/folders/你的文献文件夹ID"
+```
+
+攒够 10 篇 → 本地编译综述 → **自动寄一封 `[CNKI-REVIEW]` 给 Spark**，你什么都不用做。
+
+### 0.3 挂实时监听（以后新邮件自动走完全程）
+
+```powershell
+python scripts/gmail_cnki_bridge.py watch --daemon --push-mode idle `
+    --batch-size 10 --topic "食源性鲜味肽高通量筛选与呈味机制解析" --mark-seen `
+    --deliver-to "spark那边的收件地址@xxx" `
+    --cloud-link "https://drive.google.com/drive/folders/你的文献文件夹ID"
+```
+
+### 0.4 手动补寄（综述已经生成过了）
+
+```powershell
+# 先看看要寄什么（不发信，存成 .eml 可以打开检查）
+python scripts/gmail_cnki_bridge.py deliver --topic "食源性鲜味肽" --dry-run
+
+# 确认后正式寄最新一批
+python scripts/gmail_cnki_bridge.py deliver --topic "食源性鲜味肽" `
+    --to "spark@xxx" --cloud-link "https://drive.google.com/..."
+
+# 指定某一批
+python scripts/gmail_cnki_bridge.py deliver --batch outputs/gmail_library/reviews/batch_2 --to "spark@xxx"
+
+# 寄单篇 PDF，让 Spark 做结构化抽取（PaperCard）
+python scripts/gmail_cnki_bridge.py deliver --pdf outputs/gmail_library/CNKI_001/CNKI_001.pdf `
+    --item-key CNKI_001 --title "鲜味肽的分离鉴定" --to "spark@xxx"
+```
+
+### 0.5 大文件走云盘
+
+Gmail 单封上限 25MB，脚本内部按 16MB 卡（base64 会膨胀约 1.37 倍）。
+超限的附件会**自动跳过并在控制台提示**，不会把整封信发失败。这时：
+
+1. 把 PDF 传到 Google Drive / OneDrive，设为「知道链接即可查看」；
+2. 用 `--cloud-link` 把链接带进正文（可重复传多个）；
+3. Spark 从正文链接去云盘取文件。
+
+### 0.6 Spark 侧要做的两件事
+
+**① 建 Gmail 过滤器**（让 Spark 只被这两类邮件唤醒）：
+
+- 主题包含 `[CNKI-REVIEW]` → 打标签 `待审综述`
+- 主题包含 `[CNKI-CARD]` → 打标签 `待抽取文献`
+
+**② 把这段设成 Spark 的常驻指令**：
+
+```text
+你是我的学位论文文献审稿助手。我会通过邮件给你派活，两类：
+
+【主题含 [CNKI-REVIEW]】自动编译的综述底本（正文内含全文，附件有 .md 和 json）
+请按 ARTA 五支柱逐条审计，输出「通过/不通过 + 证据」，再给修订后的综述全文：
+  1. 定量溯源：每个数字和结论能否指到具体文献的具体页码？溯源率需≥90%。
+  2. 因果链：机制解释是否连贯、有无跳步。
+  3. 局限性：是否写明现有研究的边界与不足。
+  4. 论证结构：是否是「A说…B说…C说…」的流水账？需改成问题导向的论证。
+  5. 零虚假引用：引用是否全部来自本批次实际入库的文献。
+
+【主题含 [CNKI-CARD]】单篇文献 PDF
+请抽取 PaperCard：标题/作者/年份/期刊/DOI/研究问题/方法/
+关键定量结果（每个数字标注页码）/结论/局限性。
+
+通用铁律：
+- 严禁编造文献、数据、页码。原文里找不到的，写「未提及」或「待核」，不要填空。
+- 正文里如果有云盘链接，需要原始 PDF 时从那里取。
+- 处理完直接回复本邮件，把结果写在正文里（我这边靠回信收结果）。
+```
+
+### 0.7 边界（说清楚，免得你踩坑）
+
+- **本机必须开着**。下载知网、编译综述、发信都在你的 Windows 上跑，
+  关机就断了。Spark 在云端不能替你连知网（它没有你的机构登录态）。
+- **云盘不是自动上传的**。`--cloud-link` 只是把你给的链接写进邮件正文，
+  脚本不会替你上传文件——需要你自己或用云盘客户端同步 `outputs/gmail_library/`。
+- **Spark 的回信不会自动回流**。它审完是回邮件给你，本仓库目前不解析这类回信，
+  你自己看邮件即可。
+
+---
+
+## A. 贴给 Spark 的提示词（本地对话式 agent）
 
 ### A1. 处理邮箱里【已有】的 PDF（一次性存量回收）
 

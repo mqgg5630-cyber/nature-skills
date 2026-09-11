@@ -5,6 +5,7 @@ Gmail ↔ CNKI Literature Bridge (Nature-Skills Edition)
 把「只推知网文献到 Gmail → 下载知网 PDF 回传 Gmail → 攒够阈值自动生成综述」
 的完整闭环封装为一个脚本，四个子命令：
 
+  deliver    把综述成果 / 单篇 PDF 通过 Gmail 寄给【云端 Spark】（Spark 只能收邮件时用）
   harvest    扫描邮箱里【已有】的 PDF 附件（任意邮件，非本系统发出的也行）→
              落盘文献库 → 去重 → 累积 → 触发综述/Spark（历史文献一次性回收）
   doctor     环境体检（Python / Gmail 凭据 / Node 22+ / nature-downloader / 可选依赖）
@@ -86,6 +87,11 @@ IMAP_PORT = 993
 
 DIGEST_PREFIX = "[CNKI-DIGEST]"
 INGEST_PREFIX = "[CNKI-INGEST]"
+# 寄给云端 Spark 的成果邮件前缀（Spark 侧按此前缀建 Gmail 过滤器）
+DELIVER_PREFIX = "[CNKI-REVIEW]"
+CARD_PREFIX = "[CNKI-CARD]"
+# Gmail 单封邮件总大小上限 25MB，留出 base64 膨胀(~1.37x)与信头余量
+MAX_ATTACH_BYTES = 16 * 1024 * 1024
 
 JSON_MARKER_OPEN = "<<<CNKI_JSON>>>"
 JSON_MARKER_CLOSE = "<<<END_CNKI_JSON>>>"
@@ -831,6 +837,151 @@ def harvest_once(
     return reports
 
 
+
+# ---------------------------------------------------------------------------
+# deliver：把成果【寄回】给云端 Spark（Spark 只能收 Gmail + 读云盘）
+# ---------------------------------------------------------------------------
+
+def _fmt_size(n: int) -> str:
+    return f"{n / 1024 / 1024:.2f} MB" if n >= 1024 * 1024 else f"{n / 1024:.1f} KB"
+
+
+def build_review_delivery_message(
+    cfg: GmailConfig,
+    topic: str,
+    batch_dir: Path,
+    to: str,
+    cloud_links: Optional[List[str]] = None,
+    inline_markdown: bool = True,
+) -> Tuple[EmailMessage, List[str]]:
+    """把一个 reviews/batch_N/ 目录打包成一封发给 Spark 的成果邮件。
+
+    设计约束：Spark 在云端，只能读 Gmail 正文 + 附件，以及我们贴进正文的云盘链接。
+    所以正文里必须自带「完整任务说明 + 综述全文」，不能只给本地路径。
+    """
+    chapter = batch_dir / "thesis_chapter1_review.md"
+    payload = batch_dir / "arta_synthesis_payload.json"
+    ppt = batch_dir / "arta_ppt_payload.json"
+
+    notes: List[str] = []
+    lines: List[str] = []
+    lines.append(f"{DELIVER_PREFIX} 综述成果交付 —— 请按下方指令处理")
+    lines.append(f"主题: {topic}")
+    lines.append(f"批次目录: {batch_dir.name}")
+    lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+
+    if cloud_links:
+        lines.append("【云盘文件】原始 PDF 与完整产物见以下链接：")
+        for link in cloud_links:
+            lines.append(f"  - {link}")
+        lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("【你的任务】")
+    lines.append("=" * 60)
+    lines.append("你收到的是一份自动编译的学位论文综述底本（附件 + 下方全文）。")
+    lines.append("请按 ARTA 五支柱标准逐条审计，并输出修订后的版本：")
+    lines.append("  1. 定量溯源：每个数字/结论能否指到具体文献的具体页码？溯源率需≥90%。")
+    lines.append("     指不到的，标注「待核」，不要替我填空。")
+    lines.append("  2. 因果链：机制解释是否连贯，有无跳步。")
+    lines.append("  3. 局限性：是否写明现有研究的边界与不足。")
+    lines.append("  4. 论证结构：是否是「A说…B说…C说…」的流水账，需改成问题导向的论证。")
+    lines.append("  5. 零虚假引用：引用是否全部来自本批次实际入库的文献，有无杜撰。")
+    lines.append("")
+    lines.append("输出要求：逐条给「通过 / 不通过 + 证据」，再给出修订后的综述全文。")
+    lines.append("严禁编造文献、数据、页码。")
+    lines.append("")
+
+    msg = EmailMessage()
+    msg["From"] = cfg.email
+    msg["To"] = to
+    msg["Subject"] = f"{DELIVER_PREFIX} {topic} | {batch_dir.name} | {time.strftime('%Y-%m-%d')}"
+
+    # 综述正文直接内联——Spark 不一定能解析附件，正文最保险
+    if inline_markdown and chapter.exists():
+        text = chapter.read_text(encoding="utf-8", errors="replace")
+        lines.append("=" * 60)
+        lines.append("【综述底本全文】")
+        lines.append("=" * 60)
+        lines.append(text)
+    lines.append("")
+
+    msg.set_content("\n".join(lines))
+
+    total = 0
+    for f, sub in ((chapter, "markdown"), (payload, "json"), (ppt, "json")):
+        if not f.exists():
+            notes.append(f"缺少产物: {f.name}")
+            continue
+        data = f.read_bytes()
+        if total + len(data) > MAX_ATTACH_BYTES:
+            notes.append(f"附件超限已跳过: {f.name}（{_fmt_size(len(data))}），请改用云盘链接")
+            continue
+        total += len(data)
+        msg.add_attachment(data, maintype="text" if sub == "markdown" else "application",
+                           subtype=sub, filename=f.name)
+    return msg, notes
+
+
+def build_card_delivery_message(
+    cfg: GmailConfig,
+    topic: str,
+    entry: Dict[str, Any],
+    pdf_path: Path,
+    to: str,
+    cloud_links: Optional[List[str]] = None,
+) -> Tuple[EmailMessage, List[str]]:
+    """把单篇 PDF 寄给 Spark，让它做结构化抽取（PaperCard）。"""
+    notes: List[str] = []
+    lines: List[str] = []
+    lines.append(f"{CARD_PREFIX} 单篇文献待抽取")
+    lines.append(f"主题: {topic}")
+    lines.append(f"item_key: {entry.get('item_key', '')}")
+    lines.append(f"标题: {entry.get('title', '')}")
+    lines.append(f"作者: {'; '.join(entry.get('authors') or []) or '—'}")
+    lines.append(f"期刊/年份: {entry.get('journal', '') or '—'} / {entry.get('year', '') or '—'}")
+    lines.append("")
+    if cloud_links:
+        lines.append("【云盘文件】")
+        for link in cloud_links:
+            lines.append(f"  - {link}")
+        lines.append("")
+    lines.append("=" * 60)
+    lines.append("【你的任务】请从附件 PDF 抽取 PaperCard，字段如下：")
+    lines.append("  标题 / 作者 / 年份 / 期刊 / DOI")
+    lines.append("  研究问题 / 方法 / 关键定量结果（每个数字标注所在页码）/ 结论 / 局限性")
+    lines.append("PDF 里找不到的字段留空并标「未提及」，严禁推测或编造。")
+    lines.append("")
+    lines.append(_json_block([entry]))
+
+    msg = EmailMessage()
+    msg["From"] = cfg.email
+    msg["To"] = to
+    msg["Subject"] = f"{CARD_PREFIX} {entry.get('item_key', '')} | {str(entry.get('title', ''))[:48]}"
+    msg.set_content("\n".join(lines))
+
+    if pdf_path.exists():
+        data = pdf_path.read_bytes()
+        if len(data) > MAX_ATTACH_BYTES:
+            notes.append(f"PDF 超过 {_fmt_size(MAX_ATTACH_BYTES)} 未附加，请改用云盘链接: {pdf_path.name}")
+        else:
+            msg.add_attachment(data, maintype="application", subtype="pdf",
+                               filename=f"{entry.get('item_key', 'paper')}.pdf")
+    else:
+        notes.append(f"PDF 不存在: {pdf_path}")
+    return msg, notes
+
+
+def find_latest_batch(library_dir: Path) -> Optional[Path]:
+    reviews = library_dir / "reviews"
+    if not reviews.exists():
+        return None
+    batches = sorted((d for d in reviews.iterdir() if d.is_dir() and d.name.startswith("batch_")),
+                     key=lambda d: int(re.sub(r"\D", "", d.name) or 0))
+    return batches[-1] if batches else None
+
+
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
@@ -925,6 +1076,91 @@ def cmd_ingest(args: argparse.Namespace, cfg: GmailConfig) -> None:
 
 
 
+
+def deliver_review(cfg: GmailConfig, topic: str, batch_dir: Path, to: str,
+                   cloud_links: Optional[List[str]] = None,
+                   dry_run: bool = False, inline: bool = True) -> Optional[Path]:
+    """把一个批次的综述成果寄给云端 Spark。"""
+    msg, notes = build_review_delivery_message(cfg, topic, batch_dir, to,
+                                               cloud_links=cloud_links, inline_markdown=inline)
+    for n in notes:
+        print(f"   ⚠️  {n}")
+    if dry_run:
+        out = save_eml(msg, Path("outputs") / "gmail_bridge_dryrun" / f"deliver_{batch_dir.name}.eml")
+        print(f"   ✅ [dry-run] 未发送，成果邮件已保存: {out}")
+        return out
+    send_message(cfg, msg)
+    print(f"   📧 已寄给 Spark: {to} | 主题: {msg['Subject']}")
+    return None
+
+
+
+def auto_deliver_if_configured(args: argparse.Namespace, cfg: GmailConfig,
+                               review_result: Dict[str, Any]) -> None:
+    """综述一生成就自动寄给云端 Spark（--deliver-to 或 env SPARK_EMAIL）。"""
+    to = getattr(args, "deliver_to", None) or os.environ.get("SPARK_EMAIL", "")
+    if not to:
+        return
+    chapter = review_result.get("chapter1_path")
+    if not chapter:
+        return
+    batch_dir = Path(chapter).parent
+    try:
+        deliver_review(cfg, args.topic, batch_dir, to,
+                       cloud_links=list(getattr(args, "cloud_link", []) or []),
+                       dry_run=False, inline=True)
+    except Exception as exc:
+        print(f"   ⚠️  自动寄送 Spark 失败（成果仍在本地 {batch_dir}）: {exc}")
+
+
+def cmd_deliver(args: argparse.Namespace, cfg: GmailConfig) -> None:
+    """把已生成的综述 / 单篇 PDF 通过 Gmail 寄给云端 Spark。"""
+    if not args.dry_run:
+        cfg.require()
+    to = args.to or os.environ.get("SPARK_EMAIL", "") or cfg.email
+    library_dir = Path(args.library)
+    cloud_links = list(args.cloud_link or [])
+
+    print("=" * 72)
+    print(f"📧 [deliver] 把成果寄给云端 Spark: {to}")
+    print("=" * 72)
+
+    if args.pdf:
+        pdf_path = Path(args.pdf)
+        entry = normalize_entries([{
+            "item_key": args.item_key or default_item_key(pdf_path.stem),
+            "title": args.title or pdf_path.stem,
+        }])[0]
+        msg, notes = build_card_delivery_message(cfg, args.topic, entry, pdf_path, to,
+                                                 cloud_links=cloud_links)
+        for n in notes:
+            print(f"   ⚠️  {n}")
+        if args.dry_run:
+            out = save_eml(msg, Path("outputs") / "gmail_bridge_dryrun" / f"card_{entry['item_key']}.eml")
+            print(f"   ✅ [dry-run] 已保存: {out}")
+        else:
+            send_message(cfg, msg)
+            print(f"   📧 已寄出单篇: {entry['item_key']}")
+        return
+
+    if args.batch:
+        batch_dir = Path(args.batch)
+    else:
+        found = find_latest_batch(library_dir)
+        if not found:
+            print(f"⚠️  {library_dir / 'reviews'} 下没有 batch_N 目录，先跑 harvest/watch 生成综述。")
+            return
+        batch_dir = found
+        print(f"   自动选中最新批次: {batch_dir}")
+
+    if not batch_dir.exists():
+        print(f"⚠️  批次目录不存在: {batch_dir}")
+        return
+    deliver_review(cfg, args.topic, batch_dir, to, cloud_links=cloud_links,
+                   dry_run=args.dry_run, inline=not args.no_inline)
+    print("=" * 72)
+
+
 def cmd_harvest(args: argparse.Namespace, cfg: GmailConfig) -> None:
     """把邮箱里【已有】的 PDF 一次性收进流水线，并按需触发 Spark 与综述。"""
     cfg.require()
@@ -959,6 +1195,7 @@ def cmd_harvest(args: argparse.Namespace, cfg: GmailConfig) -> None:
             if r.get("review_triggered"):
                 res = r["review_result"]
                 print(f"   🎉 批次 #{res['batch_id']} 综述编译完成: {res['chapter1_path']}")
+                auto_deliver_if_configured(args, cfg, res)
                 fire_hook(hook_cmd, hook_url, {
                     "event": "review_ready", "topic": args.topic, "batch_id": res.get("batch_id"),
                     "paper_count": res.get("paper_count"), "chapter1_path": res.get("chapter1_path"),
@@ -1290,6 +1527,10 @@ def main() -> None:
                          help="事件发生时执行的本地命令；事件 JSON 经 env CNKI_EVENT 和 stdin 传入（供 Spark 接管）")
     p_watch.add_argument("--webhook", type=str, default=None,
                          help="事件发生时 POST 的 HTTP 回调地址（JSON body）")
+    p_watch.add_argument("--deliver-to", type=str, default=None,
+                         help="综述生成后自动寄给该邮箱（云端 Spark），或 env SPARK_EMAIL")
+    p_watch.add_argument("--cloud-link", action="append", default=[],
+                         help="随成果邮件附上的云盘链接（可重复传）")
 
     p_harv = sub.add_parser("harvest", help="扫描邮箱里【已有】的 PDF 附件并入库（一次性历史回收）")
     p_harv.add_argument("--folder", type=str, default="INBOX", help="IMAP 文件夹，如 INBOX / \"[Gmail]/All Mail\" / 自建标签")
@@ -1308,6 +1549,23 @@ def main() -> None:
     p_harv.add_argument("--dry-run", action="store_true", help="只列清单不落盘（强烈建议先跑一次）")
     p_harv.add_argument("--on-event", type=str, default=None, help="事件钩子命令（同 watch）")
     p_harv.add_argument("--webhook", type=str, default=None, help="事件 webhook（同 watch）")
+    p_harv.add_argument("--deliver-to", type=str, default=None,
+                        help="综述生成后自动寄给该邮箱（云端 Spark），或 env SPARK_EMAIL")
+    p_harv.add_argument("--cloud-link", action="append", default=[],
+                        help="随成果邮件附上的云盘链接（可重复传）")
+
+    p_del = sub.add_parser("deliver", help="把综述成果/单篇PDF通过 Gmail 寄给云端 Spark")
+    p_del.add_argument("--to", type=str, default=None, help="Spark 的收件地址（或 env SPARK_EMAIL）")
+    p_del.add_argument("--topic", type=str, default="知网文献自动综述")
+    p_del.add_argument("--library", type=str, default="outputs/gmail_library")
+    p_del.add_argument("--batch", type=str, default=None, help="指定 reviews/batch_N 目录（默认最新一批）")
+    p_del.add_argument("--pdf", type=str, default=None, help="改为寄送单篇 PDF 让 Spark 抽取 PaperCard")
+    p_del.add_argument("--item-key", type=str, default=None, help="配合 --pdf")
+    p_del.add_argument("--title", type=str, default=None, help="配合 --pdf")
+    p_del.add_argument("--cloud-link", action="append", default=[],
+                       help="云盘链接（可重复传），会写进正文供 Spark 取文件")
+    p_del.add_argument("--no-inline", action="store_true", help="正文不内联综述全文，只发附件")
+    p_del.add_argument("--dry-run", action="store_true", help="不发送，保存 .eml")
 
     p_doctor = sub.add_parser("doctor", help="环境体检（Python/凭据/Node/下载器/可选依赖）")
     p_doctor.add_argument("--node", type=str, default="node")
@@ -1325,6 +1583,8 @@ def main() -> None:
         cmd_ingest(args, cfg)
     elif args.mode == "watch":
         cmd_watch(args, cfg)
+    elif args.mode == "deliver":
+        cmd_deliver(args, cfg)
     elif args.mode == "harvest":
         cmd_harvest(args, cfg)
     elif args.mode == "doctor":
